@@ -69,6 +69,101 @@ class BM25Searcher:
 
         return score
 
+class BM25WordReplacer:
+    """直近履歴 (before/after) と BM25 を活用した安全な単語置換エンジン"""
+    def __init__(self, bm25_searcher=None):
+        self.bm25 = bm25_searcher or BM25Searcher()
+
+    def extract_replacement_pairs(self, before_text, after_text, min_len=1):
+        """
+        before(元文) と after(入力/変換後文) の差分から置換ペア (old, new) を抽出
+        例: ("今日は晴れです", "今日は雨です") -> [("晴れ", "雨")]
+        """
+        matcher = difflib.SequenceMatcher(None, before_text, after_text)
+        pairs = []
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == 'replace':
+                old_word = before_text[i1:i2]
+                new_word = after_text[j1:j2]
+                if len(old_word) >= min_len and len(new_word) >= min_len:
+                    pairs.append((old_word, new_word))
+        return pairs
+
+    def _calc_text_context_score(self, target_text, context_tokens):
+        """特定のテキストが指定のトークン群（文脈）とどれだけBM25スコアで共起するか評価"""
+        target_tokens = self.bm25.tokenize(target_text)
+        if not target_tokens or not context_tokens:
+            return 0.0
+
+        score = 0.0
+        doc_len = len(target_tokens)
+        avgdl = self.bm25.avgdl if self.bm25.avgdl > 0 else 1.0
+
+        tf_dict = Counter(target_tokens)
+        for token in context_tokens:
+            if token in tf_dict:
+                tf = tf_dict[token]
+                idf = self.bm25.idf.get(token, 0.1)
+                num = tf * (self.bm25.k1 + 1)
+                den = tf + self.bm25.k1 * (1 - self.bm25.b + self.bm25.b * (doc_len / avgdl))
+                score += idf * (num / den)
+
+        return score
+
+    def replace_and_validate(self, response_candidate, memory_before_list, memory_after_list, tolerance=0.15):
+        """
+        置換の適用とBM25履歴差分検証を行うメインルーチン
+        
+        response_candidate : BM25等で引いてきた返答候補文 (beforeベース)
+        memory_before_list : 直近最大128件の before 履歴
+        memory_after_list  : 直近最大128件の after 履歴
+        tolerance          : 文脈親和性スコア低下の許容比率 (0.15 = 15%低下まで許容)
+        """
+        if not memory_before_list or not memory_after_list:
+            return response_candidate
+
+        # 1. 直近履歴から置換可能なペアを全抽出
+        candidate_pairs = []
+        for b_text, a_text in zip(memory_before_list, memory_after_list):
+            pairs = self.extract_replacement_pairs(b_text, a_text)
+            candidate_pairs.extend(pairs)
+
+        if not candidate_pairs:
+            return response_candidate
+
+        # 2. 直近の文脈トークン集合を作成 (after履歴から構築)
+        recent_context_text = " ".join(memory_after_list)
+        context_tokens = self.bm25.tokenize(recent_context_text)
+
+        # 3. 応答候補文の中に置換可能な語があるか検索
+        s_current = response_candidate
+        for old_word, new_word in candidate_pairs:
+            if old_word in s_current and old_word != new_word:
+                # 仮置換文を生成
+                s_after_temp = s_current.replace(old_word, new_word, 1)
+
+                # 置換前後の文脈親和性（BM25スコア）を評価
+                score_before = self._calc_text_context_score(s_current, context_tokens)
+                score_after = self._calc_text_context_score(s_after_temp, context_tokens)
+
+                # 検証: 置換によってスコアが著しく暴落していないかチェック
+                # ( score_before が 0 の場合は直近文脈に含まれる語への置換なら昇格 )
+                is_valid = False
+                if score_before > 0:
+                    if score_after >= (score_before * (1.0 - tolerance)):
+                        is_valid = True
+                else:
+                    if score_after >= score_before:
+                        is_valid = True
+
+                if is_valid:
+                    print(f"[置換成功] '{old_word}' -> '{new_word}' (Score: {score_before:.3f} -> {score_after:.3f})")
+                    s_current = s_after_temp
+                else:
+                    print(f"[置換ブロック] トピック離脱を検知 ('{old_word}' -> '{new_word}')")
+
+        return s_current
+
 class NgramTokenizer:
     def __init__(self):
         self.char_counts = Counter()
@@ -441,6 +536,27 @@ class Himawaria:
 
         return None
 
+    def generate_response(self, user_input, user_name):
+        # 1. 既存の BM25 による応答文抽出 (beforeベースの決定)
+        response_base = self.looking(user_input, user_name)
+
+        if not response_base:
+            return "..."
+
+        # 2. BM25 インデックスが更新されている場合は検索器を同期
+        if hasattr(self, "bm25"):
+            self.word_replacer.bm25 = self.bm25
+
+        # 3. 置換と差分検証を実行（安全な応答文を取得）
+        final_response = self.word_replacer.replace_and_validate(
+            response_candidate=response_base,
+            memory_before_list=self.word_replacer_memory_before,
+            memory_after_list=self.word_replacer_memory_after,
+            tolerance=0.15
+        )
+
+        return final_response
+
     def record(self):
         if self.current_voice:
             self.learnSentence(self.current_voice, "!")
@@ -559,6 +675,9 @@ class Himawaria:
     
     def get_current_voice(self):
         return self.current_voice
+    
+    def get_last_bot_response(self):
+        return self.last_bot_response
     
     def get_last_user(self):
         return self.last_user
