@@ -5,11 +5,75 @@ from rapidfuzz.distance import Levenshtein
 from collections import Counter
 import difflib
 
+import math
+from collections import Counter
+
+class BM25Searcher:
+    def __init__(self, k1=1.5, b=0.75):
+        self.k1 = k1
+        self.b = b
+        self.doc_len = []
+        self.avgdl = 0
+        self.doc_freqs = []
+        self.idf = {}
+        self.corpus_size = 0
+        self.docs_tokens = []
+
+    @staticmethod
+    def tokenize(text, n=2):
+        """文字N-gramトークナイザ（分かち書き不要・純Python）"""
+        if len(text) < n:
+            return [text] if text else []
+        return [text[i:i+n] for i in range(len(text) - n + 1)]
+
+    def fit(self, corpus):
+        """記憶データ全体からBM25インデックスを事前構築"""
+        self.corpus_size = len(corpus)
+        if self.corpus_size == 0:
+            return
+
+        self.docs_tokens = [self.tokenize(doc) for doc in corpus]
+        self.doc_len = [len(tokens) for tokens in self.docs_tokens]
+        self.avgdl = sum(self.doc_len) / self.corpus_size if self.corpus_size > 0 else 0
+
+        # ドキュメント頻度 (df) の集計
+        df = Counter()
+        for tokens in self.docs_tokens:
+            frequencies = Counter(tokens)
+            self.doc_freqs.append(frequencies)
+            for token in frequencies.keys():
+                df[token] += 1
+
+        # Okapi BM25 の IDF 計算
+        for token, freq in df.items():
+            self.idf[token] = math.log((self.corpus_size - freq + 0.5) / (freq + 0.5) + 1.0)
+
+    def get_score(self, query_tokens, index):
+        """指定したインデックスの記憶とのBM25スコアを算出"""
+        score = 0.0
+        doc_tokens = self.doc_freqs[index]
+        d_len = self.doc_len[index]
+
+        if self.avgdl == 0:
+            return 0.0
+
+        for token in query_tokens:
+            if token not in doc_tokens:
+                continue
+            idf = self.idf.get(token, 0.0)
+            tf = doc_tokens[token]
+            # BM25 Core Formula
+            num = tf * (self.k1 + 1)
+            den = tf + self.k1 * (1 - self.b + self.b * (d_len / self.avgdl))
+            score += idf * (num / den)
+
+        return score
+
 class NgramTokenizer:
     def __init__(self):
         self.char_counts = Counter()
         self.bigram_counts = Counter()
-        self.forced_words = set()  # 追加：絶対に分割しない単語リスト
+        self.forced_words = set()
         
     def train(self, corpus_list):
         """1文字と2文字の出現頻度をカウント"""
@@ -21,10 +85,7 @@ class NgramTokenizer:
             self.bigram_counts.update(bigrams)
 
     def register_words(self, words_list):
-        """
-        追加：分割してほしくない単語を辞書として登録する
-        例: tokenizer.register_words(["学校", "マック"])
-        """
+        """分割してほしくない単語を辞書として登録する"""
         self.forced_words.update(words_list)
 
     def _get_cohesion_score(self, c1, c2):
@@ -35,7 +96,7 @@ class NgramTokenizer:
         return self.bigram_counts[bigram] / self.char_counts[c1]
 
     def tokenize(self, text, drop_threshold=0.3):
-        """結合度スコアがしきい値より低いタイミングで区切る（登録単語は優先して結合）"""
+        """結合度スコアがしきい値より低いタイミングで区切る"""
         if len(text) <= 1:
             return [text]
             
@@ -46,16 +107,13 @@ class NgramTokenizer:
             c1, c2 = text[i], text[i+1]
             candidate = current_word + c2
             
-            # --- 追加：現在組み立て中の文字列が「登録単語」の先頭に一致するかチェック ---
             is_part_of_forced_word = any(
                 fw.startswith(candidate) for fw in self.forced_words
             )
             
             if is_part_of_forced_word:
-                # 登録単語の一部なら、しきい値を無視して強制結合
                 current_word = candidate
             else:
-                # 通常のN-gramしきい値判定
                 score = self._get_cohesion_score(c1, c2)
                 if score < drop_threshold:
                     words.append(current_word)
@@ -68,45 +126,43 @@ class NgramTokenizer:
             
         return words
     
-    # --- ここから保存・読み込みの機能を追加 ---
     def save(self, file_path):
         """学習済みの統計データをファイルに保存する"""
-        # 保存したいデータ（インスタンス変数）を辞書にまとめる
         self_to_save = {
             'char_counts': self.char_counts,
             'bigram_counts': self.bigram_counts
         }
         with open(file_path, 'wb') as f:
             pickle.dump(self_to_save, f)
-        #print(f"🎉 モデルを正常に保存しました: {file_path}")
 
     def load(self, file_path):
         """保存されたファイルから統計データを復元する"""
         with open(file_path, 'rb') as f:
             loaded_self = pickle.load(f)
-        # 復元したデータをクラスにセット
         self.char_counts = loaded_self['char_counts']
         self.bigram_counts = loaded_self['bigram_counts']
         print(f"🚀 モデルを正常に読み込みました: {file_path}")
 
 class Himawaria:
-    def __init__(self, directory, maximum_word_replacer_memory=128):
+    def __init__(self, directory, maximum_word_replacer_memory=128, min_similarity_threshold=0.45):
         self.direc = directory
         self.maximum_word_replacer_memory = maximum_word_replacer_memory
+        # ハルシネーション（無理な引き当て）防止用の最低類似度スコア
+        self.min_similarity_threshold = min_similarity_threshold
 
-        self.memory = None #別途読み込むデータ
-        self.settings = None #設定
-        self.heart = None #今の気持ち(ログの座標で表される)
-        self.last_bot_response = "" #最後のbotの言葉
-        self.last_bot_base = "" #最後のbotのベース発言
-        self.last_input_content = "" #最後に聞いた言葉
-        self.last_input_similar = "" #最後に聞いた言葉
-        self.last_bot_baseUser = "" #過去に今からBOTが話すことと似た話をしてたユーザー
-        self.last_input_user = "" #過去に今ユーザーから話されたことと似た話をしてたユーザー
-        self.pre_heart = 0 #一つ前の気持ち
-        self.last_user = "あんた" #最後に話したユーザー
-        self.last_user_bot_replied = "あんた" #最後に返信したユーザー
-        self.current_voice = None #心の中の声
+        self.memory = None
+        self.settings = None
+        self.heart = None
+        self.last_bot_response = ""
+        self.last_bot_base = ""
+        self.last_input_content = ""
+        self.last_input_similar = ""
+        self.last_bot_baseUser = ""
+        self.last_input_user = ""
+        self.pre_heart = 0
+        self.last_user = "あんた"
+        self.last_user_bot_replied = "あんた"
+        self.current_voice = None
         self.user_log = [None] * 10
         self.word_replacer_memory_after = []
         self.word_replacer_memory_before = []
@@ -129,14 +185,8 @@ class Himawaria:
         with open(self.direc+"/memory_backup.json", "w", encoding="utf8") as f:
             json.dump(self.memory, f, ensure_ascii=False, indent=4, sort_keys=True, separators=(',', ': '))
 
-        try:
-            self.memory["word_replacer_memory_after"]
-        except:
-            self.memory["word_replacer_memory_after"] = []
-        try:
-            self.memory["word_replacer_memory_before"]
-        except:
-            self.memory["word_replacer_memory_before"] = []
+        self.memory.setdefault("word_replacer_memory_after", [])
+        self.memory.setdefault("word_replacer_memory_before", [])
         
         self.word_replacer_memory_after = self.memory["word_replacer_memory_after"]
         self.word_replacer_memory_before = self.memory["word_replacer_memory_before"]
@@ -148,19 +198,12 @@ class Himawaria:
             for sen in self.memory["sentence"]:
                 self.tokenizer.train([sen[0]])
                 self.tokenizer.train([sen[1]])
-        self.heart = random.randint(0, len(self.memory["sentence"]) - 1) #今の気持ち(ログの座標で表される)
-
-        self.current_voice = None
-
+        self.heart = random.randint(0, max(0, len(self.memory["sentence"]) - 1))
 
     def learnSentence(self, x, u, save=True, directLearning=False):
-        #if len(self.memory["sentence"]) >= 1000 or directLearning:
-        
-        #directLearningがTrueのときに自分の名前以外を無効にする
         if u not in self.settings["mynames"].split("|") and directLearning and u not in ["!input", "!output", "!system"]:
             u = "!input-"+u
 
-        #言葉を脳に記録する
         if u in self.settings["mynames"].split("|"):
             self.memory["sentence"].append([x, "!output"])
         else:
@@ -184,105 +227,86 @@ class Himawaria:
     def evalute(self):
         flag1 = False
         flag2 = False
-        if self.memory["sentence"][len(self.memory["sentence"])-1][0] != "!bad" and self.memory["sentence"][len(self.memory["sentence"])-1][0] != "!good":
-            if self.heart+1 < len(self.memory["sentence"]) - 1:
-                if self.memory["sentence"][self.heart+1][0] == "!good" and self.memory["sentence"][-1][0] != "!good":
+        if self.memory["sentence"][-1][0] not in ["!bad", "!good"]:
+            if self.heart + 1 < len(self.memory["sentence"]) - 1:
+                if self.memory["sentence"][self.heart+1][0] == "!good":
                     flag1 = True
             if flag1:
                 print("このメッセージは良い")
                 self.learnSentence("!good", "!system")
 
-        if self.memory["sentence"][len(self.memory["sentence"])-1][0] != "!bad" and self.memory["sentence"][len(self.memory["sentence"])-1][0] != "!good" and not flag1:
-            if self.heart+1 < len(self.memory["sentence"]) - 1:
-                if self.memory["sentence"][self.heart+1][0] == "!bad" and self.memory["sentence"][-1][0] != "!bad":
+        if self.memory["sentence"][-1][0] not in ["!bad", "!good"] and not flag1:
+            if self.heart + 1 < len(self.memory["sentence"]) - 1:
+                if self.memory["sentence"][self.heart+1][0] == "!bad":
                     flag2 = True
             if flag2:
                 print("このメッセージは悪い")
                 self.learnSentence("!bad", "!system")
 
     def isNextOk(self):
-        if len(self.memory["sentence"]) - 1 <= self.heart+1:
+        if len(self.memory["sentence"]) - 1 <= self.heart + 1:
             return False
-        else:
-            return self.last_input_content != self.memory["sentence"][self.heart+1][0] and self.last_bot_response != self.memory["sentence"][self.heart+1][0] and self.memory["sentence"][self.heart+1][1] == self.memory["sentence"][self.heart][1] and self.memory["sentence"][self.heart+1][1] != "!" and "!system" not in self.memory["sentence"][self.heart+1][1]
+        next_sen = self.memory["sentence"][self.heart + 1]
+        curr_sen = self.memory["sentence"][self.heart]
+        return (self.last_input_content != next_sen[0] and
+                self.last_bot_response != next_sen[0] and
+                next_sen[1] == curr_sen[1] and
+                next_sen[1] != "!" and
+                "!system" not in next_sen[1])
 
     def replaceWords(self, x, inputs, inputsHeart):
+        """
+        単語置換処理: 助詞や短いトークンの破壊的・誤認置換を抑制し、安全な置換を実施
+        """
         replacements = []
         w3 = self.tokenizer.tokenize(x, drop_threshold=0.4)
-        for i in range(0, len(inputs)):
+        
+        for i in range(len(inputs)):
             if not inputs[i] or not inputsHeart[i]:
                 continue
             w1 = self.tokenizer.tokenize(inputs[i], drop_threshold=0.4)
             w2 = self.tokenizer.tokenize(inputsHeart[i], drop_threshold=0.4)
 
-            # 差分を取得
             diffs = list(difflib.ndiff(w2, w1))
-            old = ""
-            new = ""
+            old, new = "", ""
             for diff in diffs:
-                tag = diff[:2]
-                content = diff[2:]
-
+                tag, content = diff[:2], diff[2:]
                 if tag == "- ":
                     old += content
                 elif tag == "+ ":
                     new += content
                 elif tag == "  ":
                     if old or new:
-                        replacements.append((old, new))
-                        old = ""
-                        new = ""
-                    replacements.append((content, content))
-            if old or new:
+                        if old and new and len(old) >= 2:  # 1文字の助詞などの置換暴走を防止
+                            replacements.append((old, new))
+                        old, new = "", ""
+            if (old or new) and len(old) >= 2:
                 replacements.append((old, new))
 
-        # 置換処理
-        i = 0
-        temp = ""
-        temp2 = ""
-        temp3 = []
-        for wo3 in w3:
+        # 置換処理 (トークン単位での高精度類似度判定のみ実行)
+        res_tokens = list(w3)
+        for idx, token in enumerate(res_tokens):
+            if len(token) <= 1:
+                continue  # 1文字トークン（助詞・ひらがな1文字等）は置換対象から外す
             for old, new in reversed(replacements):
-                if Levenshtein.normalized_similarity(wo3, old) >= 0.85:
-                    print("{} => {}".format(old, new))
-                    w3[i] = new
-                    temp = ""
-                    temp2 = ""
-                    temp3 = []
+                sim = Levenshtein.normalized_similarity(token, old)
+                if sim >= 0.85:
+                    print(f"単語置換: {token} ({old}) => {new}")
+                    res_tokens[idx] = new
                     break
-                elif Levenshtein.normalized_similarity(wo3, temp) >= 0.85:
-                    print("{} => {}".format(temp, temp2))
-                    for t3 in temp3:
-                        w3[t3] = ""
-                    w3[i] = temp2
-                    temp = ""
-                    temp2 = ""
-                    temp3 = []
-                    break
-                elif wo3 in old:
-                    temp = old.replace(wo3, "")
-                    temp2 = new
-                    temp3.append(i)
-                    break
-                elif wo3 in temp:
-                    temp = temp.replace(wo3, "")
-                    temp3.append(i)
-                    break
-            i += 1
-        result = "".join(w3)
-        return result
 
+        return "".join(res_tokens)
 
     def isAvailable(self, d, b, type=1):
         if type == 0:
             flag = False
             for i in range(1):
-                if b+2+i < len(self.memory["sentence"]) - 1:
+                if b + 2 + i < len(self.memory["sentence"]) - 1:
                     if self.memory["sentence"][b+2+i][0] == "!good":
                         flag = True
                         break
             for i in range(1):
-                if b+2+i < len(self.memory["sentence"]) - 1:
+                if b + 2 + i < len(self.memory["sentence"]) - 1:
                     if self.memory["sentence"][b+2+i][0] == "!bad":
                         flag = False
                         break
@@ -290,188 +314,148 @@ class Himawaria:
         elif type == 1:
             flag = True
             for i in range(1):
-                if b+2+i < len(self.memory["sentence"]) - 1:
+                if b + 2 + i < len(self.memory["sentence"]) - 1:
                     if self.memory["sentence"][b+2+i][0] == "!bad":
                         flag = False
                         break
             return flag
 
+    def update_bm25_index(self):
+        """記憶データの入力文一覧を取り出してBM25を構築"""
+        corpus = [s[0] for s in self.memory["sentence"]]
+        self.bm25 = BM25Searcher(k1=1.5, b=0.75)
+        self.bm25.fit(corpus)
+
+    def _find_best_match_bm25(self, x, start_idx, end_idx, avail_type, min_score=0.1, strict_speaker=True):
+        """BM25を用いた類似記憶検索"""
+        if not hasattr(self, "bm25") or self.bm25.corpus_size != len(self.memory["sentence"]):
+            self.update_bm25_index()
+
+        query_tokens = BM25Searcher.tokenize(x)
+        best_score = min_score
+        best_b = None
+
+        for idx in range(start_idx, end_idx):
+            if idx + 1 >= len(self.memory["sentence"]):
+                break
+
+            next_reply = self.memory["sentence"][idx + 1]
+
+            # BM25スコアの計算
+            score = self.bm25.get_score(query_tokens, idx)
+
+            if score > best_score:
+                speaker_check = (next_reply[1] != self.memory["sentence"][idx][1]) if strict_speaker else True
+
+                is_dup = self._is_duplicate(
+                    next_reply[0], 
+                    self.last_input_content, 
+                    self.last_bot_response, 
+                    self.last_bot_base
+                )
+
+                if (speaker_check and 
+                    not is_dup and
+                    "!system" not in next_reply[1] and
+                    next_reply[0] not in ["!bad", "!good"] and
+                    next_reply[1] != "!"):
+                    
+                    if self.isAvailable(score, idx, avail_type):
+                        best_score = score
+                        best_b = idx
+
+        return best_b, best_score
+    
+    def _is_duplicate(self, reply, last_input, last_bot_resp, last_bot_base):
+        """短文や記号（「？」など）が重複判定で弾かれるのを防ぐヘルパー"""
+        # 1〜2文字の超短文・記号の場合
+        if len(reply) <= 2:
+            # BOTが直前に言ったセリフと完全一致する場合のみ連投防止で弾く
+            return reply == last_bot_resp or reply == last_bot_base
+        
+        # 通常の文章の場合は 0.85 以上の高類似度重複を弾く
+        if Levenshtein.normalized_similarity(reply, last_input) >= 0.85:
+            return True
+        if Levenshtein.normalized_similarity(reply, last_bot_resp) >= 0.85:
+            return True
+        if Levenshtein.normalized_similarity(reply, last_bot_base) >= 0.85:
+            return True
+            
+        return False
+
     def looking(self, x, u, reply=True, force=False):
-        #過去の発言をもとに考える
-        print("思考中: {}".format(x))
+        print(f"思考中: {x}")
+        total_len = len(self.memory["sentence"])
+        if total_len < 2:
+            return None
 
-        #今の気持ちから考える
-        f = self.heart+1
-        t = len(self.memory["sentence"]) - 1
-        i = f
-        d = 0
-        b = None
-        for sen in self.memory["sentence"][f:t]:
-            c = Levenshtein.normalized_similarity(x, sen[0]) 
-            if c > d:
-                if (i != len(self.memory["sentence"]) and
-                    Levenshtein.normalized_similarity(self.memory["sentence"][i+1][0], self.last_input_content) < 0.85 and
-                    Levenshtein.normalized_similarity(self.memory["sentence"][i+1][0], self.last_bot_response) < 0.85 and
-                    Levenshtein.normalized_similarity(self.memory["sentence"][i+1][0], self.last_bot_base) < 0.85 and
-                    "!system" not in self.memory["sentence"][i+1][1] and
-                    "!input" not in self.memory["sentence"][i+1][1] and
-                    self.memory["sentence"][i+1][0] != "!bad" and
-                    self.memory["sentence"][i+1][0] != "!good" and
-                    self.memory["sentence"][i+1][1] != "!" and
-                    self.memory["sentence"][i+1][1] != self.memory["sentence"][i][1]):
-                    if self.isAvailable(c, i, 0):
-                        d = c
-                        b = i
-            i += 1
-        f = 0
-        t = self.heart-1
-        i = f
-        for sen in self.memory["sentence"][f:t]:
-            c = Levenshtein.normalized_similarity(x, sen[0]) 
-            if c > d:
-                if (i != len(self.memory["sentence"]) and
-                    Levenshtein.normalized_similarity(self.memory["sentence"][i+1][0], self.last_input_content) < 0.85 and
-                    Levenshtein.normalized_similarity(self.memory["sentence"][i+1][0], self.last_bot_response) < 0.85 and
-                    Levenshtein.normalized_similarity(self.memory["sentence"][i+1][0], self.last_bot_base) < 0.85 and
-                    "!system" not in self.memory["sentence"][i+1][1] and
-                    "!input" not in self.memory["sentence"][i+1][1] and
-                    self.memory["sentence"][i+1][0] != "!bad" and
-                    self.memory["sentence"][i+1][0] != "!good" and
-                    self.memory["sentence"][i+1][1] != "!" and
-                    self.memory["sentence"][i+1][1] != self.memory["sentence"][i][1]):
-                    if self.isAvailable(c, i, 0):
-                        d = c
-                        b = i
-            i += 1
-        if b != None:
-            print("類似: {}, {}, {}".format(self.memory["sentence"][b][0], b, d))
-            print("返信: {}, {}".format(self.memory["sentence"][b+1][0], b+1))
+        # インデックスの同期チェック
+        if not hasattr(self, "bm25") or self.bm25.corpus_size != total_len:
+            self.update_bm25_index()
+
+        f = min(self.heart + 1, total_len - 1)
+        prev_f = max(0, self.heart - 1)
+
+        # -------------------------------------------------------------
+        # 1. 通常検索 (BM25: strict_speaker=True, 閾値=0.5)
+        # -------------------------------------------------------------
+        b, d = self._find_best_match_bm25(x, f, total_len - 1, avail_type=0, min_score=0.5, strict_speaker=True)
+        if b is None:
+            b, d = self._find_best_match_bm25(x, 0, prev_f, avail_type=0, min_score=0.5, strict_speaker=True)
+
+        if b is None:
+            b, d = self._find_best_match_bm25(x, f, total_len - 1, avail_type=1, min_score=0.5, strict_speaker=True)
+        if b is None:
+            b, d = self._find_best_match_bm25(x, 0, prev_f, avail_type=1, min_score=0.5, strict_speaker=True)
+
+        # -------------------------------------------------------------
+        # 2. 緩和検索 (BM25: strict_speaker=False ＋ 閾値 0.05 に緩和)
+        # -------------------------------------------------------------
+        if b is None:
+            print("通常マッチなし: 発言者制限解除＋BM25低閾値で再探索します")
+            fallback_score = 0.05
+            
+            b, d = self._find_best_match_bm25(x, f, total_len - 1, avail_type=1, min_score=fallback_score, strict_speaker=False)
+            if b is None:
+                b, d = self._find_best_match_bm25(x, 0, prev_f, avail_type=1, min_score=fallback_score, strict_speaker=False)
+
+        # -------------------------------------------------------------
+        # 3. 救済検索 (完全未学習テキスト対策: 閾値 0.0 で最大スコア記憶を強制抽出)
+        # -------------------------------------------------------------
+        if b is None and force:
+            print("完全ヒットなし: BM25最良の記憶を抽出します")
+            b, d = self._find_best_match_bm25(x, 0, total_len - 1, avail_type=1, min_score=0.0, strict_speaker=False)
+
+        # -------------------------------------------------------------
+        # 結果の適用
+        # -------------------------------------------------------------
+        if b is not None:
+            print(f"類似: {self.memory['sentence'][b][0]}, idx: {b}, BM25Score: {d:.3f}")
+            print(f"返信: {self.memory['sentence'][b+1][0]}, idx: {b+1}")
             self.last_input_similar = self.memory["sentence"][b][0]
             self.last_input_user = self.memory["sentence"][b][1]
-            self.heart = b+1
-            self.last_bot_baseUser = self.memory["sentence"][b+1][1]
-            self.last_bot_base = self.memory["sentence"][b+1][0]
-            return self.memory["sentence"][b+1][0]
-
-        #今の気持ちから考える
-        f = self.heart+1
-        t = len(self.memory["sentence"]) - 1
-        i = f
-        d = 0
-        b = None
-        for sen in self.memory["sentence"][f:t]:
-            c = Levenshtein.normalized_similarity(x, sen[0]) 
-            if c > d:
-                if (i != len(self.memory["sentence"]) and
-                    Levenshtein.normalized_similarity(self.memory["sentence"][i+1][0], self.last_input_content) < 0.85 and
-                    Levenshtein.normalized_similarity(self.memory["sentence"][i+1][0], self.last_bot_response) < 0.85 and
-                    Levenshtein.normalized_similarity(self.memory["sentence"][i+1][0], self.last_bot_base) < 0.85 and
-                    "!system" not in self.memory["sentence"][i+1][1] and
-                    "!input" not in self.memory["sentence"][i+1][1] and
-                    self.memory["sentence"][i+1][0] != "!bad" and
-                    self.memory["sentence"][i+1][0] != "!good" and
-                    self.memory["sentence"][i+1][1] != "!" and
-                    self.memory["sentence"][i+1][1] != self.memory["sentence"][i][1]):
-                    if self.isAvailable(c, i, 1):
-                        d = c
-                        b = i
-            i += 1
-        f = 0
-        t = self.heart-1
-        i = f
-        for sen in self.memory["sentence"][f:t]:
-            c = Levenshtein.normalized_similarity(x, sen[0]) 
-            if c > d:
-                if (i != len(self.memory["sentence"]) and
-                    Levenshtein.normalized_similarity(self.memory["sentence"][i+1][0], self.last_input_content) < 0.85 and
-                    Levenshtein.normalized_similarity(self.memory["sentence"][i+1][0], self.last_bot_response) < 0.85 and
-                    Levenshtein.normalized_similarity(self.memory["sentence"][i+1][0], self.last_bot_base) < 0.85 and
-                    "!system" not in self.memory["sentence"][i+1][1] and
-                    "!input" not in self.memory["sentence"][i+1][1] and
-                    self.memory["sentence"][i+1][0] != "!bad" and
-                    self.memory["sentence"][i+1][0] != "!good" and
-                    self.memory["sentence"][i+1][1] != "!" and
-                    self.memory["sentence"][i+1][1] != self.memory["sentence"][i][1]):
-                    if self.isAvailable(c, i, 1):
-                        d = c
-                        b = i
-            i += 1
-        if b != None:
-            print("類似: {}, {}, {}".format(self.memory["sentence"][b][0], b, d))
-            print("返信: {}, {}".format(self.memory["sentence"][b+1][0], b+1))
-            self.last_input_similar = self.memory["sentence"][b][0]
-            self.last_input_user = self.memory["sentence"][b][1]
-            self.heart = b+1
-            self.last_bot_baseUser = self.memory["sentence"][b+1][1]
-            self.last_bot_base = self.memory["sentence"][b+1][0]
-            return self.memory["sentence"][b+1][0]
-
-        #今の気持ちから考える
-        f = self.heart+1
-        t = len(self.memory["sentence"]) - 1
-        i = f
-        d = 0
-        b = None
-        for sen in self.memory["sentence"][f:t]:
-            c = Levenshtein.normalized_similarity(x, sen[0]) 
-            if c > d:
-                if (i != len(self.memory["sentence"]) and
-                    Levenshtein.normalized_similarity(self.memory["sentence"][i+1][0], self.last_input_content) < 0.85 and
-                    Levenshtein.normalized_similarity(self.memory["sentence"][i+1][0], self.last_bot_response) < 0.85 and
-                    Levenshtein.normalized_similarity(self.memory["sentence"][i+1][0], self.last_bot_base) < 0.85 and
-                    "!system" not in self.memory["sentence"][i+1][1] and
-                    "!input" not in self.memory["sentence"][i+1][1] and
-                    self.memory["sentence"][i+1][0] != "!bad" and
-                    self.memory["sentence"][i+1][0] != "!good"):
-                    if self.isAvailable(c, i, 1):
-                        d = c
-                        b = i
-            i += 1
-        f = 0
-        t = self.heart-1
-        i = f
-        for sen in self.memory["sentence"][f:t]:
-            c = Levenshtein.normalized_similarity(x, sen[0]) 
-            if c > d:
-                if (i != len(self.memory["sentence"]) and
-                    Levenshtein.normalized_similarity(self.memory["sentence"][i+1][0], self.last_input_content) < 0.85 and
-                    Levenshtein.normalized_similarity(self.memory["sentence"][i+1][0], self.last_bot_response) < 0.85 and
-                    Levenshtein.normalized_similarity(self.memory["sentence"][i+1][0], self.last_bot_base) < 0.85 and
-                    "!system" not in self.memory["sentence"][i+1][1] and
-                    "!input" not in self.memory["sentence"][i+1][1] and
-                    self.memory["sentence"][i+1][0] != "!bad" and
-                    self.memory["sentence"][i+1][0] != "!good"):
-                    if self.isAvailable(c, i, 1):
-                        d = c
-                        b = i
-            i += 1
-        if b != None:
-            print("類似: {}, {}, {}".format(self.memory["sentence"][b][0], b, d))
-            print("返信: {}, {}".format(self.memory["sentence"][b+1][0], b+1))
-            self.last_input_similar = self.memory["sentence"][b][0]
-            self.last_input_user = self.memory["sentence"][b][1]
-            self.heart = b+1
+            self.heart = b + 1
             self.last_bot_baseUser = self.memory["sentence"][b+1][1]
             self.last_bot_base = self.memory["sentence"][b+1][0]
             return self.memory["sentence"][b+1][0]
 
         return None
-    
+
     def record(self):
-        self.learnSentence(self.current_voice, "!")
-        self.evalute()
+        if self.current_voice:
+            self.learnSentence(self.current_voice, "!")
+            self.evalute()
         
     def speakFreely(self, is_active_learning=True):
-        #自由に話す
         result = self.current_voice
         if "!" not in self.last_user:
             self.last_userReplied = self.last_user
         self.user_log.append("!")
         self.user_log.pop(0)
-        if result != None:
+        if result is not None:
             self.word_replacer_memory_after.append(result)
             self.word_replacer_memory_before.append(self.last_bot_base)
-            if self.last_bot_baseUser == "!" or self.last_bot_baseUser == "!output":
+            if self.last_bot_baseUser in ["!", "!output"]:
                 for myname in reversed(self.settings["mynames"].split("|")):
                     self.word_replacer_memory_after.append(myname)
                     self.word_replacer_memory_before.append(self.last_bot_baseUser)
@@ -495,7 +479,7 @@ class Himawaria:
                 self.last_userReplied = self.last_user
             self.user_log.append("!")
             self.user_log.pop(0)
-            if result != None:
+            if result is not None:
                 result = self.replaceWords(result, self.word_replacer_memory_after, self.word_replacer_memory_before)
 
                 self.word_replacer_memory_after.append(result)
@@ -503,10 +487,9 @@ class Himawaria:
                 for myname in reversed(self.settings["mynames"].split("|")):
                     self.word_replacer_memory_after.append(myname)
                     self.word_replacer_memory_before.append(self.last_bot_baseUser)
-                if len(self.word_replacer_memory_after) > self.maximum_word_replacer_memory*(len(self.settings["mynames"].split("|"))+1):
-                    self.word_replacer_memory_after = self.word_replacer_memory_after[-self.maximum_word_replacer_memory*(len(self.settings["mynames"].split("|"))+1):]
-                if len(self.word_replacer_memory_before) > self.maximum_word_replacer_memory*(len(self.settings["mynames"].split("|"))+1):
-                    self.word_replacer_memory_before = self.word_replacer_memory_before[-self.maximum_word_replacer_memory*(len(self.settings["mynames"].split("|"))+1):]
+                limit = self.maximum_word_replacer_memory * (len(self.settings["mynames"].split("|")) + 1)
+                self.word_replacer_memory_after = self.word_replacer_memory_after[-limit:]
+                self.word_replacer_memory_before = self.word_replacer_memory_before[-limit:]
                 self.memory["word_replacer_memory_after"] = self.word_replacer_memory_after
                 self.memory["word_replacer_memory_before"] = self.word_replacer_memory_before
 
@@ -515,11 +498,9 @@ class Himawaria:
         else:
             return None
 
-
     def receive(self, x, u, is_active_learning=True, reply=True, force=False):
-        if x == None or u == None: return
-        #if u not in self.memory["words"]:
-        #    self.memory["words"].append(u)
+        if x is None or u is None:
+            return None
         
         self.pre_heart = self.heart
         self.last_input_content = x
@@ -527,12 +508,6 @@ class Himawaria:
             self.last_user = u
             self.user_log.append(u)
             self.user_log.pop(0)
-        
-        """
-        if random.randint(0,4) == 0:
-            print("シャッフルしました")
-            self.heart = random.randint(0, len(self.memory["sentence"]) - 1) #今の気持ち(ログの座標で表される)
-        """
         
         if is_active_learning:
             self.learnSentence(x, u)
@@ -542,38 +517,39 @@ class Himawaria:
                 self.memory["sentence"].insert(self.heart+1, ["!good", "!"])
         result = self.looking(x, u, force=force, reply=reply)
         
-        if result == None:
+        if result is None:
             self.current_voice = None
-            return
+            return None
 
         self.word_replacer_memory_after.append(x)
         self.word_replacer_memory_before.append(self.last_input_similar)
 
         if "!system" not in u:
-            if u != "!" and u != "!output" and self.last_input_user != "!" and self.last_input_user != "!output":
+            if u not in ["!", "!output"] and self.last_input_user not in ["!", "!output"]:
                 self.word_replacer_memory_after.append(u)
                 self.word_replacer_memory_before.append(self.last_input_user)
-            elif (self.last_input_user == "!" or self.last_input_user == "!output") and u != "!" and u != "!output":
+            elif self.last_input_user in ["!", "!output"] and u not in ["!", "!output"]:
                 for myname in reversed(self.settings["mynames"].split("|")):
                     self.word_replacer_memory_after.append(u)
                     self.word_replacer_memory_before.append(myname)
-            elif (u == "!" or u == "!output") and self.last_input_user != "!" and self.last_input_user != "!output":
+            elif u in ["!", "!output"] and self.last_input_user not in ["!", "!output"]:
                 for myname in reversed(self.settings["mynames"].split("|")):
                     self.word_replacer_memory_after.append(myname)
                     self.word_replacer_memory_before.append(self.last_input_user)
-        if len(self.word_replacer_memory_after) > self.maximum_word_replacer_memory*(len(self.settings["mynames"].split("|"))+1):
-            self.word_replacer_memory_after = self.word_replacer_memory_after[-self.maximum_word_replacer_memory*(len(self.settings["mynames"].split("|"))+1):]
-        if len(self.word_replacer_memory_before) > self.maximum_word_replacer_memory*(len(self.settings["mynames"].split("|"))+1):
-            self.word_replacer_memory_before = self.word_replacer_memory_before[-self.maximum_word_replacer_memory*(len(self.settings["mynames"].split("|"))+1):]
+        
+        limit = self.maximum_word_replacer_memory * (len(self.settings["mynames"].split("|")) + 1)
+        self.word_replacer_memory_after = self.word_replacer_memory_after[-limit:]
+        self.word_replacer_memory_before = self.word_replacer_memory_before[-limit:]
 
         self.memory["word_replacer_memory_after"] = self.word_replacer_memory_after
         self.memory["word_replacer_memory_before"] = self.word_replacer_memory_before
             
         result = self.replaceWords(result, self.word_replacer_memory_after, self.word_replacer_memory_before)
         self.current_voice = result
-        print("座標: {}".format(self.heart))
-        print("ログ: {}".format(self.user_log))
-        print("心の声: {}".format(result))
+        print(f"座標: {self.heart}")
+        print(f"ログ: {self.user_log}")
+        print(f"心の声: {result}")
+        return result
 
     def get_settings(self):
         return self.settings
