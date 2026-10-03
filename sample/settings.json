@@ -1,0 +1,15 @@
+{
+    "myname": "sample",
+    "mynames": "sample|Sample|サンプル",
+    "defaultMode": 2,
+    "irc":{
+        "host": "localhost",
+        "port": 6667,
+        "defaultChannel": "#博麗神社"
+    },
+    "discToken": "TOKEN",
+    "fluxerToken": "TOKEN",
+    "voice": 2,
+    "languageHear": "ja",
+    "hear": false
+}
