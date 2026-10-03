@@ -176,7 +176,7 @@ class Himawaria:
         if save:
             self.saveData()
 
-    def save(self):
+    def saveData(self):
         with open(self.direc+"/memory.json", "w", encoding="utf8") as f:
             json.dump(self.memory, f, ensure_ascii=False, indent=4, sort_keys=True, separators=(',', ': '))
         self.tokenizer.save(self.direc+"/tokenizer.model")
