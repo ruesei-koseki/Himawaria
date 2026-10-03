@@ -208,15 +208,12 @@ class Himawaria:
 
     def replaceWords(self, x, inputs, inputsHeart):
         replacements = []
-        self.tokenizer.train([x])
         w3 = self.tokenizer.tokenize(x, drop_threshold=0.4)
         for i in range(0, len(inputs)):
             if not inputs[i] or not inputsHeart[i]:
                 continue
             self.tokenizer.train([inputs[i]])
             self.tokenizer.train([inputsHeart[i]])
-            w1 = self.tokenizer.tokenize(inputs[i], drop_threshold=0.4)
-            w2 = self.tokenizer.tokenize(inputsHeart[i], drop_threshold=0.4)
 
             # 差分を取得
             diffs = list(difflib.ndiff(w2, w1))
