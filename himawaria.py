@@ -69,7 +69,7 @@ class NgramTokenizer:
         return words
     
     # --- ここから保存・読み込みの機能を追加 ---
-    def saveData(self, file_path):
+    def save(self, file_path):
         """学習済みの統計データをファイルに保存する"""
         # 保存したいデータ（インスタンス変数）を辞書にまとめる
         self_to_save = {
