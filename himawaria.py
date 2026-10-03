@@ -4,9 +4,7 @@ import pickle
 from rapidfuzz.distance import Levenshtein
 from collections import Counter
 import difflib
-
 import math
-from collections import Counter
 
 class BM25Searcher:
     def __init__(self, k1=1.5, b=0.75):
@@ -147,7 +145,6 @@ class BM25WordReplacer:
                 score_after = self._calc_text_context_score(s_after_temp, context_tokens)
 
                 # 検証: 置換によってスコアが著しく暴落していないかチェック
-                # ( score_before が 0 の場合は直近文脈に含まれる語への置換なら昇格 )
                 is_valid = False
                 if score_before > 0:
                     if score_after >= (score_before * (1.0 - tolerance)):
@@ -242,7 +239,6 @@ class Himawaria:
     def __init__(self, directory, maximum_word_replacer_memory=128, min_similarity_threshold=0.45):
         self.direc = directory
         self.maximum_word_replacer_memory = maximum_word_replacer_memory
-        # ハルシネーション（無理な引き当て）防止用の最低類似度スコア
         self.min_similarity_threshold = min_similarity_threshold
 
         self.memory = None
@@ -261,6 +257,7 @@ class Himawaria:
         self.user_log = [None] * 10
         self.word_replacer_memory_after = []
         self.word_replacer_memory_before = []
+        self.word_replacer = BM25WordReplacer()
         self.rate = 1.0
 
         try:
@@ -372,17 +369,16 @@ class Himawaria:
                     new += content
                 elif tag == "  ":
                     if old or new:
-                        if old and new and len(old) >= 2:  # 1文字の助詞などの置換暴走を防止
+                        if old and new and len(old) >= 2:
                             replacements.append((old, new))
                         old, new = "", ""
             if (old or new) and len(old) >= 2:
                 replacements.append((old, new))
 
-        # 置換処理 (トークン単位での高精度類似度判定のみ実行)
         res_tokens = list(w3)
         for idx, token in enumerate(res_tokens):
             if len(token) <= 1:
-                continue  # 1文字トークン（助詞・ひらがな1文字等）は置換対象から外す
+                continue
             for old, new in reversed(replacements):
                 sim = Levenshtein.normalized_similarity(token, old)
                 if sim >= 0.85:
@@ -416,8 +412,31 @@ class Himawaria:
             return flag
 
     def update_bm25_index(self):
-        """記憶データの入力文一覧を取り出してBM25を構築"""
-        corpus = [s[0] for s in self.memory["sentence"]]
+        """発言者（ユーザー名 / Bot）のタグを含めてBM25インデックスを構築"""
+        sentences = self.memory["sentence"]
+        corpus = []
+        mynames = set(self.settings.get("mynames", "").split("|")) | {"!output"}
+
+        for i in range(len(sentences)):
+            curr_text, speaker = sentences[i][0], sentences[i][1]
+            curr_tag = "[Bot]" if speaker in mynames else f"[{speaker}]"
+            curr_doc = f"{curr_tag}{curr_text}"
+            
+            # 1つ前の発言をタグ付きで文脈化
+            prev_context = ""
+            if i > 0 and "!system" not in sentences[i-1][1]:
+                prev_text, prev_speaker = sentences[i-1][0], sentences[i-1][1]
+                prev_tag = "[Bot]" if prev_speaker in mynames else f"[{prev_speaker}]"
+                prev_context = f"{prev_tag}{prev_text}"
+            
+            # 直前文脈 ＋ 現在発言（2倍の重み付け）
+            if prev_context:
+                combined_doc = f"{prev_context} {curr_doc} {curr_doc}"
+            else:
+                combined_doc = f"{curr_doc} {curr_doc}"
+                
+            corpus.append(combined_doc)
+
         self.bm25 = BM25Searcher(k1=1.5, b=0.75)
         self.bm25.fit(corpus)
 
@@ -463,12 +482,9 @@ class Himawaria:
     
     def _is_duplicate(self, reply, last_input, last_bot_resp, last_bot_base):
         """短文や記号（「？」など）が重複判定で弾かれるのを防ぐヘルパー"""
-        # 1〜2文字の超短文・記号の場合
         if len(reply) <= 2:
-            # BOTが直前に言ったセリフと完全一致する場合のみ連投防止で弾く
             return reply == last_bot_resp or reply == last_bot_base
         
-        # 通常の文章の場合は 0.85 以上の高類似度重複を弾く
         if Levenshtein.normalized_similarity(reply, last_input) >= 0.85:
             return True
         if Levenshtein.normalized_similarity(reply, last_bot_resp) >= 0.85:
@@ -488,66 +504,95 @@ class Himawaria:
         if not hasattr(self, "bm25") or self.bm25.corpus_size != total_len:
             self.update_bm25_index()
 
+        user_tag = f"[{u}]"
+        
+        # 1. テキスト本体のみのクエリ（タグを含めず、言葉の一致だけで絞り込む）
+        tokens_text_only = BM25Searcher.tokenize(x)
+        
+        # 2. 文脈＋タグも含めた評価用クエリ
+        context_prefix = f"[Bot]{self.last_bot_response} " if self.last_bot_response else ""
+        tokens_context = BM25Searcher.tokenize(f"{context_prefix}{user_tag}{x}")
+
         f = min(self.heart + 1, total_len - 1)
         prev_f = max(0, self.heart - 1)
 
         # -------------------------------------------------------------
-        # 1. 通常検索 (BM25: strict_speaker=True, 閾値=0.5)
+        # 第1段階：テキスト本体（`x`）の一致度だけで候補上位N件を収集
         # -------------------------------------------------------------
-        b, d = self._find_best_match_bm25(x, f, total_len - 1, avail_type=0, min_score=0.5, strict_speaker=True)
-        if b is None:
-            b, d = self._find_best_match_bm25(x, 0, prev_f, avail_type=0, min_score=0.5, strict_speaker=True)
+        candidates = []  # (text_score, idx) のリスト
 
-        if b is None:
-            b, d = self._find_best_match_bm25(x, f, total_len - 1, avail_type=1, min_score=0.5, strict_speaker=True)
-        if b is None:
-            b, d = self._find_best_match_bm25(x, 0, prev_f, avail_type=1, min_score=0.5, strict_speaker=True)
-
-        # -------------------------------------------------------------
-        # 2. 緩和検索 (BM25: strict_speaker=False ＋ 閾値 0.05 に緩和)
-        # -------------------------------------------------------------
-        if b is None:
-            print("通常マッチなし: 発言者制限解除＋BM25低閾値で再探索します")
-            fallback_score = 0.05
+        for idx in range(total_len - 1):
+            next_reply = self.memory["sentence"][idx + 1]
             
-            b, d = self._find_best_match_bm25(x, f, total_len - 1, avail_type=1, min_score=fallback_score, strict_speaker=False)
-            if b is None:
-                b, d = self._find_best_match_bm25(x, 0, prev_f, avail_type=1, min_score=fallback_score, strict_speaker=False)
+            # 発言者の重複チェックやシステムログの除外
+            is_dup = self._is_duplicate(
+                next_reply[0], 
+                self.last_input_content, 
+                self.last_bot_response, 
+                self.last_bot_base
+            )
+            
+            if (not is_dup and 
+                "!system" not in next_reply[1] and 
+                next_reply[0] not in ["!bad", "!good"] and 
+                next_reply[1] != "!"):
+
+                # テキスト単体の純粋なBM25スコアを計算
+                text_score = self.bm25.get_score(tokens_text_only, idx)
+                if text_score > 0.01:
+                    candidates.append((text_score, idx))
+
+        if not candidates and force:
+            # 該当が一つもない場合の非常事態用
+            for idx in range(total_len - 1):
+                candidates.append((0.0, idx))
+
+        if not candidates:
+            return None
+
+        # テキストスコアが高い順にソートし、上位10件に絞り込む
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        top_candidates = candidates[:10]
 
         # -------------------------------------------------------------
-        # 3. 救済検索 (完全未学習テキスト対策: 閾値 0.0 で最大スコア記憶を強制抽出)
+        # 第2段階：上位10件の中で、文脈・タグ（`tokens_context`）が最も合うものを決定
         # -------------------------------------------------------------
-        if b is None and force:
-            print("完全ヒットなし: BM25最良の記憶を抽出します")
-            b, d = self._find_best_match_bm25(x, 0, total_len - 1, avail_type=1, min_score=0.0, strict_speaker=False)
+        best_b = None
+        best_final_score = -1.0
+
+        for text_score, idx in top_candidates:
+            context_score = self.bm25.get_score(tokens_context, idx)
+            # テキストスコア(1次通過組) + 文脈補正スコア
+            final_score = text_score + (context_score * 0.5)
+
+            if final_score > best_final_score:
+                best_final_score = final_score
+                best_b = idx
 
         # -------------------------------------------------------------
-        # 結果の適用
+        # 判定結果の適用
         # -------------------------------------------------------------
-        if b is not None:
-            print(f"類似: {self.memory['sentence'][b][0]}, idx: {b}, BM25Score: {d:.3f}")
-            print(f"返信: {self.memory['sentence'][b+1][0]}, idx: {b+1}")
-            self.last_input_similar = self.memory["sentence"][b][0]
-            self.last_input_user = self.memory["sentence"][b][1]
-            self.heart = b + 1
-            self.last_bot_baseUser = self.memory["sentence"][b+1][1]
-            self.last_bot_base = self.memory["sentence"][b+1][0]
-            return self.memory["sentence"][b+1][0]
+        if best_b is not None:
+            print(f"類似: {self.memory['sentence'][best_b][0]}, idx: {best_b}, FinalScore: {best_final_score:.3f}")
+            print(f"返信: {self.memory['sentence'][best_b+1][0]}, idx: {best_b+1}")
+            self.last_input_similar = self.memory["sentence"][best_b][0]
+            self.last_input_user = self.memory["sentence"][best_b][1]
+            self.heart = best_b + 1
+            self.last_bot_baseUser = self.memory["sentence"][best_b+1][1]
+            self.last_bot_base = self.memory["sentence"][best_b+1][0]
+            return self.memory["sentence"][best_b+1][0]
 
         return None
 
     def generate_response(self, user_input, user_name):
-        # 1. 既存の BM25 による応答文抽出 (beforeベースの決定)
         response_base = self.looking(user_input, user_name)
 
         if not response_base:
             return "..."
 
-        # 2. BM25 インデックスが更新されている場合は検索器を同期
         if hasattr(self, "bm25"):
             self.word_replacer.bm25 = self.bm25
 
-        # 3. 置換と差分検証を実行（安全な応答文を取得）
         final_response = self.word_replacer.replace_and_validate(
             response_candidate=response_base,
             memory_before_list=self.word_replacer_memory_before,
@@ -685,5 +730,5 @@ class Himawaria:
 
 if __name__ == "__main__":
     a = Himawaria("kasen")
-    print(a.receive("こんにちは", "小関琉聖だった人", True))
-    print(a.receive("調子はどう？", "小関琉聖だった人", True))
+    print(a.receive("こんにちは", "ユーザー", True))
+    print(a.receive("調子はどう？", "ユーザー", True))

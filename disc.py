@@ -320,12 +320,11 @@ async def cron():
                             await speak(result)
                     messages = []
             if random.randint(0, 60*25) == 0 and himawaria_instance.get_current_voice() != None:
-                if himawaria_instance.get_current_voice() != himawaria_instance.get_last_bot_response():
-                    result = himawaria_instance.speakFreely(add=add)
-                    if result == None:
-                        pass
-                    else:
-                        await speak(result)
+                result = himawaria_instance.speakFreely(add=add)
+                if result == None:
+                    pass
+                else:
+                    await speak(result)
         elif mode == 2:
             if len(messages) != 0:
                 pss = []
@@ -344,12 +343,11 @@ async def cron():
                 else:
                     denominator = len(people)-1
                 if bool(re.search(himawaria_instance.himawari_instance.get_settings()["mynames"], lastMessage[0])) or isinstance(channel, discord.channel.DMChannel) or ((not bool(re.search(aaa, lastMessage[0])) or aaa == "") and random.randint(0, denominator) == 0 and himawaria_instance.get_current_voice() != None):
-                    if himawaria_instance.get_current_voice() != himawaria_instance.get_last_bot_response():
-                        result = himawaria_instance.speakFreely(add=add)
-                        if result == None:
-                            pass
-                        else:
-                            await speak(result)
+                    result = himawaria_instance.speakFreely(add=add)
+                    if result == None:
+                        pass
+                    else:
+                        await speak(result)
                 messages = []
         elif mode == 3:
             if len(messages) != 0:
@@ -369,12 +367,11 @@ async def cron():
                 else:
                     denominator = len(people)-2
                 if bool(re.search(himawaria_instance.himawari_instance.get_settings()["mynames"], lastMessage[0])) or isinstance(channel, discord.channel.DMChannel) or ((not bool(re.search(aaa, lastMessage[0])) or aaa == "") and random.randint(0, denominator) == 0 and himawaria_instance.get_current_voice() != None):
-                    if himawaria_instance.get_current_voice() != himawaria_instance.get_last_bot_response():
-                        result = himawaria_instance.speakFreely(add=add)
-                        if result == None:
-                            pass
-                        else:
-                            await speak(result)
+                    result = himawaria_instance.speakFreely(add=add)
+                    if result == None:
+                        pass
+                    else:
+                        await speak(result)
                 messages = []
         if dt_now - dt >= datetime.timedelta(seconds=20):
             if i > -2:
@@ -394,12 +391,11 @@ async def cron():
             else:
                 denominator = len(people)-2
             if mode == 2 and random.randint(0, denominator) == 0:
-                if himawaria_instance.get_current_voice() != himawaria_instance.get_last_bot_response():
-                    result = himawaria_instance.speakFreely(add=add)
-                    if result == None:
-                        pass
-                    else:
-                        await speak(result)
+                result = himawaria_instance.speakFreely(add=add)
+                if result == None:
+                    pass
+                else:
+                    await speak(result)
         
     except:
         import traceback
