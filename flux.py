@@ -86,16 +86,6 @@ async def speak(result):
                         target_channel = await bot.fetch_channel(int(com[2]))
                         if target_channel != None:
                             channel = target_channel
-                            try:
-                                print("チャンネルを移動しました: {}".format(channel.name))
-                                himawaria_instance.receive("チャンネルを移動しました: {}".format(channel.name), "!system", is_active_learning=is_active_learning)
-                                people = [[himawaria_instance.get_settings()["myname"], 0]]
-                                messages.append(["チャンネルを移動しました: {}".format(channel.name), "!system"])
-                            except:
-                                print("チャンネルを移動しました: DM")
-                                himawaria_instance.receive("チャンネルを移動しました: DM", "!system", is_active_learning=is_active_learning)
-                                people = [[himawaria_instance.get_settings()["myname"], 0]]
-                                messages.append(["チャンネルを移動しました: DM", "!system"])
                         else:
                             print("チャンネルが存在しません")
                             himawaria_instance.receive("チャンネルが存在しません", "!system", is_active_learning=is_active_learning)

@@ -89,16 +89,6 @@ async def speak(result):
                     if not pin:
                         if client.get_channel(int(com[2])) != None:
                             channel = client.get_channel(int(com[2]))
-                            try:
-                                print("チャンネルを移動しました: {}".format(channel.name))
-                                himawaria_instance.receive("チャンネルを移動しました: {}".format(channel.name), "!system", add=add)
-                                people = [[himawaria_instance.himawari_instance.get_settings()["myname"], 0]]
-                                messages.append(["チャンネルを移動しました: {}".format(channel.name), "!system"])
-                            except:
-                                print("チャンネルを移動しました: DM")
-                                himawaria_instance.receive("チャンネルを移動しました: DM", "!system", add=add)
-                                people = [[himawaria_instance.himawari_instance.get_settings()["myname"], 0]]
-                                messages.append(["チャンネルを移動しました: DM", "!system"])
                         else:
                             print("チャンネルが存在しません")
                             himawaria_instance.receive("チャンネルが存在しません", "!system", add=add)
