@@ -385,11 +385,7 @@ async def cron():
             if bool(pattern.search(dt_now.strftime('%Y/%m/%d %H:%M:%S'))):
                 himawaria_instance.receive(dt_now.strftime('%Y/%m/%d %H:%M:%S'), "!systemClock", add=add)
             print("沈黙を検知")
-            if len(people)-2 <= 0:
-                denominator = 0
-            else:
-                denominator = len(people)-2
-            if mode == 2 and random.randint(0, denominator) == 0:
+            if (mode == 2 and random.randint(0, 13) == 0) or (mode == 3 and random.randint(0, 8) == 0) and (mode == 3 and random.randint(0, 180) == 0):
                 result = himawaria_instance.speakFreely(add=add)
                 if result == None:
                     pass
