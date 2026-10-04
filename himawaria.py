@@ -575,11 +575,15 @@ class Himawaria:
         for text_score, idx in top_candidates:
             context_score = self.bm25.get_score(tokens_context, idx)
             
-            # ★ 重み調整: 今の入力スコア(text_score)をベースに、文脈(context_score)は最大30%程度の補助にとどめる
-            final_score = text_score + (context_score * 0.3)
+            # 1. 文脈スコアに一定の係数（例: 0.3）をかけた値を用意
+            raw_context = context_score * 0.3
 
-            if self._has_good_tag(idx):
-                final_score *= 1.5
+            # 2. text_score を上限（キャップ）として制限する
+            # (text_score が 0 なら context_score も 0 になる)
+            capped_context = min(raw_context, text_score)
+
+            # 3. 最終スコアの計算
+            final_score = text_score + capped_context
 
             if final_score > best_final_score:
                 best_final_score = final_score
