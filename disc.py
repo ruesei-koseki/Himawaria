@@ -32,6 +32,7 @@ i = 0
 is_active_learning = True
 kaisu = 0
 dt = datetime.datetime.now()
+hold_message = [None, None]
 
 
 helpMessage = f"""==Himawaria ヘルプ==
@@ -71,7 +72,7 @@ def setMode(x):
 
 kaisu = 0
 async def speak(result):
-    global channel, people, mode, pin, lastMessage, messages, kaisu, dt, add, i, yukou
+    global channel, people, mode, pin, lastMessage, messages, kaisu, dt, add, i, yukou, hold_message
     try:
         print("{}: {}".format(himawaria_instance.get_settings()["myname"], result))
         pattern = re.compile(r"^!command")
@@ -126,6 +127,8 @@ async def speak(result):
                     await channel.send(Message)
                     if is_active_learning:
                         himawaria_instance.record()
+                    else:
+                        hold_message = [Message, "!"]
                     nxt = himawaria_instance.nextSpeak()
                     if nxt:
                         print("続きを返信します")
@@ -258,6 +261,11 @@ async def on_message(message):
             himawaria_instance.saveData()
             print("完了")
             return
+
+        if hold_message[0]:
+            himawaria_instance.receive("!command ignore", himawaria_instance.get_last_user(), is_active_learning=True)
+            himawaria_instance.receive(hold_message[0], hold_message[1], force=True)
+            hold_message = [None, None]
         
         print("受信: {}, from {}".format(message.content, username))
         yukou = False

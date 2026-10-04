@@ -20,24 +20,21 @@ class BM25Searcher:
 
     @staticmethod
     def tokenize(text, n=2):
-        """
-        連続する数字列（IDや数値など）は1つのトークンとしてまとめ、
-        テキスト部分のみを文字N-gramにするトークナイザ
-        """
         if not text:
             return []
 
+        # 2文字以上の同じ文字の連続は「2文字」に圧縮する（例: "..." や "...." -> "..", "ーーー" -> "ーー"）
+        text = re.sub(r'(.)\1{2,}', r'\1\1', text)
+
         tokens = []
-        # 数字列 (\d+) と それ以外 に分割
         parts = re.split(r'(\d+)', text)
         for part in parts:
             if not part:
                 continue
             if part.isdigit():
-                # 連続する数字はひとまとまりで1トークンとする
                 tokens.append(part)
             else:
-                # テキスト部分はN-gram分割
+                # 2文字に圧縮された ".." や "ーー" は len == 2 なので、そのまま1つの2-gramトークンになる
                 if len(part) < n:
                     tokens.append(part)
                 else:
@@ -435,29 +432,37 @@ class Himawaria:
             return flag
 
     def update_bm25_index(self):
-        """発言者（ユーザー名 / Bot）のタグを含めてBM25インデックスを構築"""
+        """Botの発言名 '!' を基準に過去へ動的に遡り、2つ前までの論理文脈を構築"""
         sentences = self.memory["sentence"]
         corpus = []
-        mynames = set(self.settings.get("mynames", "").split("|")) | {"!output"}
 
         for i in range(len(sentences)):
             curr_text, speaker = sentences[i][0], sentences[i][1]
-            curr_tag = "[Bot]" if speaker in mynames else f"[{speaker}]"
+            curr_tag = "[!]" if speaker == "!" else f"[{speaker}]"
             curr_doc = f"{curr_tag}{curr_text}"
-            
-            # 1つ前の発言をタグ付きで文脈化
-            prev_context = ""
-            if i > 0 and "!system" not in sentences[i-1][1]:
-                prev_text, prev_speaker = sentences[i-1][0], sentences[i-1][1]
-                prev_tag = "[Bot]" if prev_speaker in mynames else f"[{prev_speaker}]"
-                prev_context = f"{prev_tag}{prev_text}"
-            
-            # 直前文脈 ＋ 現在発言（2倍の重み付け）
-            if prev_context:
-                combined_doc = f"{prev_context} {curr_doc} {curr_doc}"
-            else:
-                combined_doc = f"{curr_doc} {curr_doc}"
-                
+
+            prev_bot_doc = ""
+            prev_input_doc = ""
+
+            # i 行目より前から動的に過去へ遡る
+            j = i - 1
+            while j >= 0:
+                s_text, s_speaker = sentences[j][0], sentences[j][1]
+                s_tag = "[!]" if s_speaker == "!" else f"[{s_speaker}]"
+
+                # まだ直近の Bot 発言が見つかっておらず、かつ speaker が "!" の場合
+                if not prev_bot_doc and s_speaker == "!":
+                    prev_bot_doc = f"{s_tag}{s_text}"
+                # Bot 発言が見つかった後（またはそれ以前）のユーザー/システム入力
+                elif prev_bot_doc and s_speaker != "!":
+                    prev_input_doc = f"{s_tag}{s_text}"
+                    break  # 必要な2文脈が揃ったら終了
+                j -= 1
+
+            # 「2つ前の入力」＋「1つ前のBot返答(!)」＋「現在の文書」を結合
+            contexts = [c for c in [prev_input_doc, prev_bot_doc, curr_doc, curr_doc] if c]
+            combined_doc = " ".join(contexts)
+
             corpus.append(combined_doc)
 
         self.bm25 = BM25Searcher(k1=1.5, b=0.75)
@@ -498,22 +503,36 @@ class Himawaria:
 
         user_tag = f"[{u}]"
         
-        # 1. テキスト本体のみのクエリ
+        # 1. テキスト本体のみのトークン（現在の入力最優先）
         tokens_text_only = BM25Searcher.tokenize(x)
         
-        # 2. 文脈＋タグも含めた評価用クエリ
-        context_prefix = f"[Bot]{self.last_bot_response} " if self.last_bot_response else ""
-        tokens_context = BM25Searcher.tokenize(f"{context_prefix}{user_tag}{x}")
+        # 2. 文脈付きクエリの構築
+        context_parts = []
+
+        # 2つ前の入力（last_input_content）
+        if hasattr(self, "last_input_content") and self.last_input_content:
+            prev_user_tag = f"[{self.last_input_user}]" if getattr(self, "last_input_user", None) else "[User]"
+            context_parts.append(f"{prev_user_tag}{self.last_input_content}")
+
+        # 1つ前の Bot 返答（"!"）
+        if self.last_bot_response:
+            context_parts.append(f"[!]{self.last_bot_response}")
+
+        # ★ 現在の入力 x を2重・3重に入れて重みを強調
+        context_parts.append(f"{user_tag}{x}")
+        context_parts.append(f"{x}")
+
+        context_str = " ".join(context_parts)
+        tokens_context = BM25Searcher.tokenize(context_str)
 
         # -------------------------------------------------------------
-        # 第1段階：テキスト本体（`x`）の一致度だけで候補上位N件を収集
+        # 第1段階：現在の入力 x のスコアだけで候補を絞る
         # -------------------------------------------------------------
-        candidates = []  # (text_score, idx) のリスト
+        candidates = []
 
         for idx in range(total_len - 1):
             next_reply = self.memory["sentence"][idx + 1]
             
-            # 発言者の重複チェックやシステムログの除外
             is_dup = self._is_duplicate(
                 next_reply[0], 
                 self.last_input_content, 
@@ -526,13 +545,14 @@ class Himawaria:
                 next_reply[0] not in ["!bad", "!good"] and 
                 next_reply[1] != "!"):
 
-                # テキスト単体の純粋なBM25スコアを計算
+                # 今の入力 x 単体でのマッチ度を計算
                 text_score = self.bm25.get_score(tokens_text_only, idx)
 
-                # !good が付いている場合は第1段階でも選考に残りやすくするためスコア補正（1.3倍）
                 if self._has_good_tag(idx):
                     text_score *= 1.3
 
+                # ★ 今の入力 x と全く無関係（スコアが低すぎる）ものはこの段階で落とす
+                # （※沈黙時などの force=True の場合は全件対象）
                 if text_score > 0.01:
                     candidates.append((text_score, idx))
 
@@ -543,22 +563,21 @@ class Himawaria:
         if not candidates:
             return None
 
-        # テキストスコアが高い順にソートし、上位15件に絞り込む
         candidates.sort(key=lambda item: item[0], reverse=True)
         top_candidates = candidates[:15]
 
         # -------------------------------------------------------------
-        # 第2段階：上位15件の中で、文脈・タグおよび !good 優遇を加えて決定
+        # 第2段階：文脈スコアを加算して最適解を決定
         # -------------------------------------------------------------
         best_b = None
         best_final_score = -1.0
 
         for text_score, idx in top_candidates:
             context_score = self.bm25.get_score(tokens_context, idx)
-            # テキストスコア + 文脈補正スコア
-            final_score = text_score + (context_score * 0.5)
+            
+            # ★ 重み調整: 今の入力スコア(text_score)をベースに、文脈(context_score)は最大30%程度の補助にとどめる
+            final_score = text_score + (context_score * 0.3)
 
-            # !good が付いている記憶に最終ボーナスを加算（1.5倍掛け）
             if self._has_good_tag(idx):
                 final_score *= 1.5
 

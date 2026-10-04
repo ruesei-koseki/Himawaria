@@ -28,6 +28,7 @@ i = 0
 is_active_learning = True
 kaisu = 0
 dt = datetime.datetime.now()
+hold_message = [None, None]
 
 # 2. Botインスタンスの作成 (Client ではなく Bot を使用)
 bot = Bot(command_prefix="!")
@@ -67,7 +68,7 @@ def setMode(x):
 
 # 発言・制御関数
 async def speak(result):
-    global channel, people, mode, pin, lastMessage, messages, kaisu, dt, is_active_learning, i, yukou
+    global channel, people, mode, pin, lastMessage, messages, kaisu, dt, is_active_learning, i, yukou, hold_message
     try:
         print("{}: {}".format(himawaria_instance.get_settings()["myname"], result))
         pattern = re.compile(r"^!command")
@@ -121,6 +122,8 @@ async def speak(result):
                 await channel.send(Message_text)
                 if is_active_learning:
                     himawaria_instance.record()
+                else:
+                    hold_message = [Message_text, "!"]
                 nxt = himawaria_instance.nextSpeak()
                 if nxt:
                     print("続きを返信します")
@@ -149,7 +152,7 @@ async def on_ready():
 # 4. メッセージ受信イベント
 @bot.event
 async def on_message(message: Message):
-    global pin, channel, people, lastMessage, messages, helpMessage, lastUsername, ii, mode, i, is_active_learning, dt, yukou
+    global pin, channel, people, lastMessage, messages, helpMessage, lastUsername, ii, mode, i, is_active_learning, dt, yukou, hold_message
 
     # システム終了コマンド
     if bool(re.search(r"休んで(良い|いい)(わ|よ|わよ)|終了して|exit bot", message.content)) and "モジホコリ、" in message.content:
@@ -234,6 +237,11 @@ async def on_message(message: Message):
             himawaria_instance.saveData()
             print("完了")
             return
+
+        if hold_message[0]:
+            himawaria_instance.receive("!command ignore", himawaria_instance.get_last_user(), is_active_learning=True)
+            himawaria_instance.receive(hold_message[0], hold_message[1], force=True)
+            hold_message = [None, None]
 
         # AIの思考・返答処理をここに続行させる場合は以下を有効化
         print("受信: {}, from {}".format(message.content, username))
