@@ -205,6 +205,11 @@ async def on_message(message: Message):
             himawaria_instance.learnSentence("!good", "!system", directLearning=True)
             return
 
+        pss = []
+        for ps in people:
+            pss.append(ps[0])
+        if username not in pss:
+            people.append([username, 0])
 
         if bool(re.search("沈黙モード|黙|だま", message.content)) and bool(re.search(himawaria_instance.get_settings()["mynames"]+"|モジホコリ、", message.content)):
             himawaria_instance.receive("!command setMode 0", username)
