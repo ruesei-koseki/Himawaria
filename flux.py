@@ -119,7 +119,8 @@ async def speak(result):
             
             if yukou:
                 await channel.send(Message_text)
-                himawaria_instance.record()
+                if is_active_learning:
+                    himawaria_instance.record()
                 nxt = himawaria_instance.nextSpeak()
                 if nxt:
                     print("続きを返信します")

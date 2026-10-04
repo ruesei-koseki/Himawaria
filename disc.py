@@ -124,7 +124,8 @@ async def speak(result):
                     await asyncio.sleep(1)
                 if yukou:
                     await channel.send(Message)
-                    himawaria_instance.record()
+                    if is_active_learning:
+                        himawaria_instance.record()
                     nxt = himawaria_instance.nextSpeak()
                     if nxt:
                         print("続きを返信します")
