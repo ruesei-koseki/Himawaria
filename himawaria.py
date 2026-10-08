@@ -170,8 +170,9 @@ class Himawaria:
         self.last_bot_base = ""
         self.last_input_content = ""
         self.last_input_similar = ""
-        self.last_bot_baseUser = ""
+        self.last_bot_base_user = ""
         self.last_input_user = ""
+        self.last_input_similar_user = ""
         self.pre_heart = 0
         self.last_user = "あんた"
         self.last_user_bot_replied = "あんた"
@@ -179,7 +180,9 @@ class Himawaria:
         self.user_log = [None] * 10
         self.word_replacer_memory_after = []
         self.word_replacer_memory_before = []
+        self.last_previous_input_user = ""
         self.rate = 1.0
+        self.latest_log = [["init", "init"]]
 
         try:
             with open(self.direc+"/memory.json", "r", encoding="utf8") as f:
@@ -333,34 +336,15 @@ class Himawaria:
             return flag
 
     def update_bm25_index(self):
-        """Botの発言名 '!' を基準に過去へ動的に遡り、2つ前までの論理文脈を構築（検索・応答選択用）"""
+        """各発言をシンプルにインデックス化する"""
         sentences = self.memory["sentence"]
         corpus = []
 
         for i in range(len(sentences)):
             curr_text, speaker = sentences[i][0], sentences[i][1]
             curr_tag = "[!]" if speaker == "!" else f"[{speaker}]"
-            curr_doc = f"{curr_tag}{curr_text}"
-
-            prev_bot_doc = ""
-            prev_input_doc = ""
-
-            j = i - 1
-            while j >= 0:
-                s_text, s_speaker = sentences[j][0], sentences[j][1]
-                s_tag = "[!]" if s_speaker == "!" else f"[{s_speaker}]"
-
-                if not prev_bot_doc and s_speaker == "!":
-                    prev_bot_doc = f"{s_tag}{s_text}"
-                elif prev_bot_doc and s_speaker != "!":
-                    prev_input_doc = f"{s_tag}{s_text}"
-                    break
-                j -= 1
-
-            contexts = [c for c in [prev_input_doc, prev_bot_doc, curr_doc, curr_doc] if c]
-            combined_doc = " ".join(contexts)
-
-            corpus.append(combined_doc)
+            # 余計な過去ログの連結をやめ、その発言単体をドキュメントにする
+            corpus.append(f"{curr_tag}{curr_text}")
 
         self.bm25 = BM25Searcher(k1=1.5, b=0.75)
         self.bm25.fit(corpus)
@@ -399,21 +383,23 @@ class Himawaria:
 
         user_tag = f"[{u}]"
         
-        tokens_text_only = BM25Searcher.tokenize(x)
-        
+        # --- 1. コンテキスト（直近最大5メッセージ）の組み立て ---
         context_parts = []
-        if hasattr(self, "last_input_content") and self.last_input_content:
-            prev_user_tag = f"[{self.last_input_user}]" if getattr(self, "last_input_user", None) else "[User]"
-            context_parts.append(f"{prev_user_tag}{self.last_input_content}")
+        
+        # 自前の履歴メッセージ（例: self.messages や self.history 等）から直近の文脈を取得
+        # ※ self.messages が [ [text, speaker], ... ] で保持されている前提
+        recent_history = getattr(self, "messages", [])[-5:]
+        for h_text, h_speaker in recent_history:
+            sp_tag = "[!]" if h_speaker in ["!", "bot"] else f"[{h_speaker}]"
+            context_parts.append(f"{sp_tag}{h_text}")
 
-        if self.last_bot_response:
-            context_parts.append(f"[!]{self.last_bot_response}")
-
+        # 今回の最新入力も末尾に追加
         context_parts.append(f"{user_tag}{x}")
         context_parts.append(f"{x}")
 
         context_str = " ".join(context_parts)
         tokens_context = BM25Searcher.tokenize(context_str)
+        tokens_text_only = BM25Searcher.tokenize(x)
 
         candidates = []
 
@@ -430,7 +416,8 @@ class Himawaria:
             if (not is_dup and 
                 "!system" not in next_reply[1] and 
                 next_reply[0] not in ["!bad", "!good"] and 
-                next_reply[1] != "!"):
+                next_reply[1] != "!" and
+                self.memory["sentence"][idx + 1][1] != self.memory["sentence"][idx][1]):
 
                 text_score = self.bm25.get_score(tokens_text_only, idx)
 
@@ -448,31 +435,104 @@ class Himawaria:
             return None
 
         candidates.sort(key=lambda item: item[0], reverse=True)
-        top_candidates = candidates[:15]
+        top_candidates = candidates[:20]
 
-        best_b = None
-        best_final_score = -1.0
+        # --- 2. 過去5発言に拡張したさかのぼり取得ロジック ---
+        # ライブ側の直近ユーザー発言（最大5件、新しい順）
+        live_user_history = []
+        for h_text, h_speaker in reversed(self.latest_log[:-2]):
+            live_user_history.append(h_text)
+            if len(live_user_history) >= 5:
+                break
+        if not live_user_history:
+            live_user_history = [x]
 
+        def get_user_history_5_at(target_idx):
+            """指定インデックスから過去へさかのぼり、最大5件のユーザー発言を取得する（新しい順）"""
+            sentences = self.memory["sentence"]
+            history = []
+            j = target_idx
+            
+            while j >= 0 and len(history) < 5:
+                s_text, s_speaker = sentences[j][0], sentences[j][1]
+                # ボット発言やシステムタグ以外のユーザー発言を収集
+                history.append(s_text)
+                j -= 1
+            return history
+
+        # 減衰重みリスト (直近ほど高く: 1.0, 0.5, 0.25, 0.125, 0.0625)
+        decay_weights = [1.0, 0.5, 0.25, 0.125, 0.0625]
+
+        scored_candidates = []
         for text_score, idx in top_candidates:
             context_score = self.bm25.get_score(tokens_context, idx)
             raw_context = context_score * 0.3
             capped_context = min(raw_context, text_score)
-            final_score = text_score + capped_context
+            
+            # 比較対象の過去メモリ側5発言
+            sim_history = get_user_history_5_at(idx)
+            
+            # さかのぼり比較の計算 (直近から順に減衰係数をかけて積算)
+            history_score_sum = 0.0
+            compare_len = min(len(live_user_history), len(sim_history))
+            
+            for k in range(compare_len):
+                # 直近履歴の発言をトークン化
+                live_tokens = BM25Searcher.tokenize(live_user_history[k])
+                
+                # 比較対象となる過去メモリの該当インデックス
+                target_idx = idx - (compare_len - k)
+                
+                if 0 <= target_idx < total_len:
+                    # BM25で直接スコアを算出
+                    bm25_sim = self.bm25.get_score(live_tokens, target_idx)
+                    history_score_sum += bm25_sim * decay_weights[k]
 
-            if final_score > best_final_score:
-                best_final_score = final_score
-                best_b = idx
+            history_match_bonus = history_score_sum * 0.3  # 重み全体調整
+
+            final_score = text_score + capped_context + history_match_bonus
+            scored_candidates.append((final_score, idx))
+
+        scored_candidates.sort(key=lambda item: item[0], reverse=True)
+
+        if not scored_candidates:
+            return None
+
+        # 1位と2位のスコア差をチェック
+        best_final_score, best_b, best_has_good = scored_candidates[0][0], scored_candidates[0][1], self._has_good_tag(scored_candidates[0][1])
+        
+        use_random = False
+        if len(scored_candidates) >= 2:
+            score_diff = scored_candidates[0][0] - scored_candidates[1][0]
+            if score_diff < 0.3:
+                use_random = True
+
+        if use_random:
+            top_candidates_for_rand = scored_candidates[:5]
+            min_score = top_candidates_for_rand[-1][0]
+            weights = []
+            for score, idx in top_candidates_for_rand:
+                base_weight = max(0.001, score - min_score + 1.0)
+                if self._has_good_tag(idx):
+                    base_weight *= 1.5
+                weights.append(base_weight)
+
+            clean_candidates = [(score, idx) for score, idx in top_candidates_for_rand]
+            chosen = random.choices(clean_candidates, weights=weights, k=1)[0]
+            best_final_score, best_b = chosen
+        else:
+            best_final_score, best_b = scored_candidates[0][0], scored_candidates[0][1]
 
         if best_b is not None:
             is_good_mark = " [★good優遇]" if self._has_good_tag(best_b) else ""
             print(f"類似: {self.memory['sentence'][best_b][0]}, idx: {best_b}, FinalScore: {best_final_score:.3f}{is_good_mark}")
             print(f"返信: {self.memory['sentence'][best_b+1][0]}, idx: {best_b+1}")
-            self.last_input_similar = self.memory["sentence"][best_b][0]
-            self.last_input_user = self.memory["sentence"][best_b][1]
+            self.last_input_similar = self.memory['sentence'][best_b][0]
+            self.last_input_similar_user = self.memory['sentence'][best_b][1]
             self.heart = best_b + 1
-            self.last_bot_baseUser = self.memory["sentence"][best_b+1][1]
-            self.last_bot_base = self.memory["sentence"][best_b+1][0]
-            return self.memory["sentence"][best_b+1][0]
+            self.last_bot_base_user = self.memory['sentence'][best_b+1][1]
+            self.last_bot_base = self.memory['sentence'][best_b+1][0]
+            return self.memory['sentence'][best_b+1][0]
 
         return None
 
@@ -501,10 +561,10 @@ class Himawaria:
         if result is not None:
             self.word_replacer_memory_after.append(result)
             self.word_replacer_memory_before.append(self.last_bot_base)
-            if self.last_bot_baseUser in ["!", "!output"]:
+            if self.last_bot_base_user in ["!", "!output"]:
                 for myname in self.settings["mynames"].split("|"):
                     self.word_replacer_memory_after.append(myname)
-                    self.word_replacer_memory_before.append(self.last_bot_baseUser)
+                    self.word_replacer_memory_before.append(self.last_bot_base_user)
             if len(self.word_replacer_memory_after) > self.maximum_word_replacer_memory:
                 self.word_replacer_memory_after = self.word_replacer_memory_after[-self.maximum_word_replacer_memory:]
             if len(self.word_replacer_memory_before) > self.maximum_word_replacer_memory:
@@ -512,7 +572,13 @@ class Himawaria:
             self.memory["word_replacer_memory_after"] = self.word_replacer_memory_after
             self.memory["word_replacer_memory_before"] = self.word_replacer_memory_before
 
+        self.last_previous_input_user = self.last_input_user
+        self.last_previous_input_content = self.last_input_content
         self.last_bot_response = result
+        if [result, "!"] != self.latest_log[-1]:
+            self.latest_log.append([result, "!"])
+        if len(self.latest_log) > 9:
+            self.latest_log = self.latest_log[-9:]
         return result
 
     def nextSpeak(self, is_active_learning=True):
@@ -520,7 +586,7 @@ class Himawaria:
             self.heart += 1
             result = self.memory["sentence"][self.heart][0]
             self.last_bot_base = result
-            self.last_bot_baseUser = self.memory["sentence"][self.heart][1]
+            self.last_bot_base_user = self.memory["sentence"][self.heart][1]
             if "!" not in self.last_user:
                 self.last_userReplied = self.last_user
             self.user_log.append("!")
@@ -532,7 +598,7 @@ class Himawaria:
                 self.word_replacer_memory_before.append(self.last_bot_base)
                 for myname in reversed(self.settings["mynames"].split("|")):
                     self.word_replacer_memory_after.append(myname)
-                    self.word_replacer_memory_before.append(self.last_bot_baseUser)
+                    self.word_replacer_memory_before.append(self.last_bot_base_user)
                 limit = self.maximum_word_replacer_memory * (len(self.settings["mynames"].split("|")) + 1)
                 self.word_replacer_memory_after = self.word_replacer_memory_after[-limit:]
                 self.word_replacer_memory_before = self.word_replacer_memory_before[-limit:]
@@ -550,6 +616,7 @@ class Himawaria:
         
         self.pre_heart = self.heart
         self.last_input_content = x
+        self.last_input_user = u
         if "!" not in u:
             self.last_user = u
             self.user_log.append(u)
@@ -561,6 +628,10 @@ class Himawaria:
                 self.memory["sentence"].insert(self.heart+1, ["!bad", "!"])
             if x == "!good" and self.memory["sentence"][self.heart+1][0] != "!good":
                 self.memory["sentence"].insert(self.heart+1, ["!good", "!"])
+        if [x, u] != self.latest_log[-1]:
+            self.latest_log.append([x, u])
+        if len(self.latest_log) > 9:
+            self.latest_log = self.latest_log[-9:]
         result = self.looking(x, u, force=force, reply=reply)
         
         if result is None:
@@ -571,17 +642,17 @@ class Himawaria:
         self.word_replacer_memory_before.append(self.last_input_similar)
 
         if "!system" not in u:
-            if u not in ["!", "!output"] and self.last_input_user not in ["!", "!output"]:
+            if u not in ["!", "!output"] and self.last_input_similar_user not in ["!", "!output"]:
                 self.word_replacer_memory_after.append(u)
-                self.word_replacer_memory_before.append(self.last_input_user)
-            elif self.last_input_user in ["!", "!output"] and u not in ["!", "!output"]:
+                self.word_replacer_memory_before.append(self.last_input_similar_user)
+            elif self.last_input_similar_user in ["!", "!output"] and u not in ["!", "!output"]:
                 for myname in self.settings["mynames"].split("|"):
                     self.word_replacer_memory_after.append(u)
                     self.word_replacer_memory_before.append(myname)
-            elif u in ["!", "!output"] and self.last_input_user not in ["!", "!output"]:
+            elif u in ["!", "!output"] and self.last_input_similar_user not in ["!", "!output"]:
                 for myname in self.settings["mynames"].split("|"):
                     self.word_replacer_memory_after.append(myname)
-                    self.word_replacer_memory_before.append(self.last_input_user)
+                    self.word_replacer_memory_before.append(self.last_input_similar_user)
 
         result = self.replaceWords(result, self.word_replacer_memory_after, self.word_replacer_memory_before)
 
