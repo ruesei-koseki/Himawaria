@@ -244,7 +244,7 @@ async def on_message(message: Message):
             return
 
         if hold_message[0]:
-            himawaria_instance.receive("!command ignore", himawaria_instance.get_last_user(), is_active_learning=True)
+            himawaria_instance.receive("!command ignore", "!system", is_active_learning=True)
             himawaria_instance.receive(hold_message[0], hold_message[1], force=True)
             hold_message = [None, None]
 
@@ -355,7 +355,7 @@ async def cron():
                     is_active_learning = False
 
                 dt = datetime.datetime.now()
-                himawaria_instance.receive("!command ignore", himawaria_instance.get_last_user(), is_active_learning=is_active_learning)
+                himawaria_instance.receive("!command ignore", "!system", is_active_learning=is_active_learning)
                 pattern = re.compile(r"(0|3)0 : [0-9][0-9]$")
                 if bool(pattern.search(dt_now.strftime('%Y/%m/%d %H:%M:%S'))):
                     himawaria_instance.receive(dt_now.strftime('%Y/%m/%d %H:%M:%S'), "!systemClock", is_active_learning=is_active_learning)
