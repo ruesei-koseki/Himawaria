@@ -536,16 +536,6 @@ class Himawaria:
 
         return None
 
-    def generate_response(self, user_input, user_name):
-        response_base = self.looking(user_input, user_name)
-
-        if not response_base:
-            return "..."
-
-        # BM25WordReplacerは使わず、通常の置換機能かそのままの候補を返す形に調整
-        # 必要であればここで self.replaceWords(...) などを適用可能ですが、
-        # 基本の応答生成としてはそのままベースを返します
-        return response_base
 
     def record(self):
         if self.current_voice:
@@ -653,8 +643,12 @@ class Himawaria:
                 for myname in self.settings["mynames"].split("|"):
                     self.word_replacer_memory_after.append(myname)
                     self.word_replacer_memory_before.append(self.last_input_similar_user)
+        limit = self.maximum_word_replacer_memory * (len(self.settings["mynames"].split("|")) + 1)
+        self.word_replacer_memory_after = self.word_replacer_memory_after[-limit:]
+        self.word_replacer_memory_before = self.word_replacer_memory_before[-limit:]
 
         result = self.replaceWords(result, self.word_replacer_memory_after, self.word_replacer_memory_before)
+
 
         self.memory["word_replacer_memory_after"] = self.word_replacer_memory_after
         self.memory["word_replacer_memory_before"] = self.word_replacer_memory_before
