@@ -417,6 +417,7 @@ class Himawaria:
                 "!system" not in next_reply[1] and 
                 next_reply[0] not in ["!bad", "!good"] and 
                 next_reply[1] != "!" and
+                "!system" not in next_reply[1] and
                 self.memory["sentence"][idx + 1][1] != self.memory["sentence"][idx][1]):
 
                 text_score = self.bm25.get_score(tokens_text_only, idx)
