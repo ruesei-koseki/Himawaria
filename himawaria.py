@@ -41,26 +41,32 @@ class BM25Searcher:
         return tokens
 
     def fit(self, corpus):
-        """記憶データ全体からBM25インデックスを事前構築"""
+        """記憶データ全体からBM25インデックスを再構築する。"""
+        # 同じインスタンスでfitを再実行しても古い統計が残らないよう初期化
+        self.doc_len = []
+        self.doc_freqs = []
+        self.idf = {}
+        self.docs_tokens = []
+        self.avgdl = 0.0
         self.corpus_size = len(corpus)
+
         if self.corpus_size == 0:
             return
 
         self.docs_tokens = [self.tokenize(doc) for doc in corpus]
         self.doc_len = [len(tokens) for tokens in self.docs_tokens]
-        self.avgdl = sum(self.doc_len) / self.corpus_size if self.corpus_size > 0 else 0
+        self.avgdl = sum(self.doc_len) / self.corpus_size
 
-        # ドキュメント頻度 (df) の集計
         df = Counter()
         for tokens in self.docs_tokens:
             frequencies = Counter(tokens)
             self.doc_freqs.append(frequencies)
-            for token in frequencies.keys():
-                df[token] += 1
+            df.update(frequencies.keys())
 
-        # Okapi BM25 の IDF 計算
-        for token, freq in df.items():
-            self.idf[token] = math.log((self.corpus_size - freq + 0.5) / (freq + 0.5) + 1.0)
+        self.idf = {
+            token: math.log((self.corpus_size - freq + 0.5) / (freq + 0.5) + 1.0)
+            for token, freq in df.items()
+        }
 
     def get_score(self, query_tokens, index):
         """指定したインデックスの記憶とのBM25スコアを算出"""
@@ -373,169 +379,211 @@ class Himawaria:
         return False
 
     def looking(self, x, u, reply=True, force=False):
+        """現在の入力に近い過去発言を検索し、その次の発言を返す。"""
         print(f"思考中: {x}")
-        total_len = len(self.memory["sentence"])
-        if total_len < 2:
+        sentences = self.memory.get("sentence", [])
+        total_len = len(sentences)
+        if total_len < 2 or not isinstance(x, str) or not x.strip():
             return None
 
-        if not hasattr(self, "bm25") or self.bm25.corpus_size != total_len:
+        # learnSentence() が先に呼ばれる設計なので、通常は件数差で再構築される。
+        # fit() 自体も安全に再実行できるよう上で修正済み。
+        if (not hasattr(self, "bm25") or
+                self.bm25.corpus_size != total_len or
+                len(self.bm25.doc_freqs) != total_len):
             self.update_bm25_index()
 
-        user_tag = f"[{u}]"
-        
-        # --- 1. コンテキスト（直近最大5メッセージ）の組み立て ---
-        context_parts = []
-        
-        # 自前の履歴メッセージ（例: self.messages や self.history 等）から直近の文脈を取得
-        # ※ self.messages が [ [text, speaker], ... ] で保持されている前提
-        recent_history = getattr(self, "messages", [])[-5:]
-        for h_text, h_speaker in recent_history:
-            sp_tag = "[!]" if h_speaker in ["!", "bot"] else f"[{h_speaker}]"
-            context_parts.append(f"{sp_tag}{h_text}")
+        tokens_query = BM25Searcher.tokenize(x)
+        if not tokens_query:
+            return None
 
-        # 今回の最新入力も末尾に追加
-        context_parts.append(f"{user_tag}{x}")
-        context_parts.append(f"{x}")
-
-        context_str = " ".join(context_parts)
-        tokens_context = BM25Searcher.tokenize(context_str)
-        tokens_text_only = BM25Searcher.tokenize(x)
-
-        candidates = []
-
-        for idx in range(total_len - 1):
-            next_reply = self.memory["sentence"][idx + 1]
-            
-            is_dup = self._is_duplicate(
-                next_reply[0], 
-                self.last_input_content, 
-                self.last_bot_response, 
-                self.last_bot_base
+        def is_system_or_marker(entry):
+            text, speaker = entry[0], str(entry[1])
+            return (
+                "!system" in speaker or
+                text in ("!bad", "!good") or
+                speaker == "!"
             )
-            
-            if (not is_dup and 
-                "!system" not in next_reply[1] and 
-                next_reply[0] not in ["!bad", "!good"] and 
-                next_reply[1] != "!" and
-                "!system" not in next_reply[1] and
-                self.memory["sentence"][idx + 1][1] != self.memory["sentence"][idx][1]):
 
-                text_score = self.bm25.get_score(tokens_text_only, idx)
+        def valid_pair(idx):
+            """idxの発言と直後の返信が検索候補として有効か判定。"""
+            if idx < 0 or idx + 1 >= total_len:
+                return False
+            source = sentences[idx]
+            response = sentences[idx + 1]
+            response_text, response_speaker = response[0], str(response[1])
 
-                if self._has_good_tag(idx):
-                    text_score *= 1.3
+            if is_system_or_marker(response):
+                return False
+            if response_text is None or not str(response_text).strip():
+                return False
+            if response_speaker == str(source[1]):
+                return False
+            if self._is_duplicate(
+                str(response_text),
+                str(self.last_input_content or ""),
+                str(self.last_bot_response or ""),
+                str(self.last_bot_base or "")
+            ):
+                return False
+            return True
 
-                if text_score > 0.01:
-                    candidates.append((text_score, idx))
+        # 現在の入力に関連する過去発言を検索。
+        # force=Trueでも無効な返信やシステム用タグを候補に戻さない。
+        candidates = []
+        for idx in range(total_len - 1):
+            if not valid_pair(idx):
+                continue
+            score = self.bm25.get_score(tokens_query, idx)
+            if self._has_good_tag(idx):
+                score *= 1.15
+            if score > 0.01:
+                candidates.append((score, idx))
 
         if not candidates and force:
-            for idx in range(total_len - 1):
-                candidates.append((0.0, idx))
-
+            candidates = [(0.0, idx) for idx in range(total_len - 1) if valid_pair(idx)]
         if not candidates:
             return None
 
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        top_candidates = candidates[:20]
-
-        # --- 2. 過去5発言に拡張したさかのぼり取得ロジック ---
-        # ライブ側の直近ユーザー発言（最大5件、新しい順）
-        live_user_history = []
-        for h_text, h_speaker in reversed(self.latest_log[:-2]):
-            live_user_history.append(h_text)
-            if len(live_user_history) >= 5:
+        # ライブ履歴から「現在の入力より前」のユーザー発言のみを取得。
+        # latest_logには通常 [発言, 話者] が格納される。
+        live_history = []
+        live_log = getattr(self, "latest_log", [])
+        prior_log = live_log[:-1] if live_log and live_log[-1] == [x, u] else live_log
+        bot_names = {"!", "!output", "bot", "init"}
+        for item in reversed(prior_log):
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            h_text, h_speaker = item[0], str(item[1])
+            if not isinstance(h_text, str) or not h_text.strip():
+                continue
+            if h_speaker in bot_names or "!system" in h_speaker or h_speaker.startswith("!input-"):
+                continue
+            live_history.append(h_text)
+            if len(live_history) >= 5:
                 break
-        if not live_user_history:
-            live_user_history = [x]
+        if not live_history:
+            live_history = []
 
-        def get_user_history_5_at(target_idx):
-            """指定インデックスから過去へさかのぼり、最大5件のユーザー発言を取得する（新しい順）"""
-            sentences = self.memory["sentence"]
+        live_history_tokens = [BM25Searcher.tokenize(t) for t in live_history]
+        decay_weights = (1.0, 0.5, 0.25, 0.125, 0.0625)
+
+        # 候補ごとに、候補発言より前にあるユーザー発言列との一致を測る。
+        def previous_user_history(target_idx, limit=5):
             history = []
-            j = target_idx
-            
-            while j >= 0 and len(history) < 5:
-                s_text, s_speaker = sentences[j][0], sentences[j][1]
-                # ボット発言やシステムタグ以外のユーザー発言を収集
-                history.append(s_text)
-                j -= 1
+            for j in range(target_idx - 1, -1, -1):
+                entry = sentences[j]
+                if is_system_or_marker(entry):
+                    continue
+                speaker = str(entry[1])
+                if speaker in bot_names or speaker.startswith("!output"):
+                    continue
+                if "!system" in speaker or speaker.startswith("!input-"):
+                    continue
+                text = entry[0]
+                if isinstance(text, str) and text.strip():
+                    history.append(text)
+                    if len(history) >= limit:
+                        break
             return history
 
-        # 減衰重みリスト (直近ほど高く: 1.0, 0.5, 0.25, 0.125, 0.0625)
-        decay_weights = [1.0, 0.5, 0.25, 0.125, 0.0625]
+        scored = []
+        for text_score, idx in candidates:
+            # 文脈スコアは入力単体より弱く扱い、極端な加点を避ける。
+            context_tokens = []
+            # 候補直前の発言を使い、存在しないself.messagesには依存しない。
+            for j in range(max(0, idx - 4), idx):
+                previous_text = sentences[j][0]
+                previous_speaker = str(sentences[j][1])
+                if (isinstance(previous_text, str) and previous_text.strip()
+                        and previous_speaker not in bot_names
+                        and "!system" not in previous_speaker
+                        and previous_text not in ("!good", "!bad")):
+                    context_tokens.extend(BM25Searcher.tokenize(previous_text))
+            context_score = self.bm25.get_score(context_tokens, idx) if context_tokens else 0.0
 
-        scored_candidates = []
-        for text_score, idx in top_candidates:
-            context_score = self.bm25.get_score(tokens_context, idx)
-            raw_context = context_score * 0.3
-            capped_context = min(raw_context, text_score)
-            
-            # 比較対象の過去メモリ側5発言
-            sim_history = get_user_history_5_at(idx)
-            
-            # さかのぼり比較の計算 (直近から順に減衰係数をかけて積算)
-            history_score_sum = 0.0
-            compare_len = min(len(live_user_history), len(sim_history))
-            
-            for k in range(compare_len):
-                # 直近履歴の発言をトークン化
-                live_tokens = BM25Searcher.tokenize(live_user_history[k])
-                
-                # 比較対象となる過去メモリの該当インデックス
-                target_idx = idx - (compare_len - k)
-                
-                if 0 <= target_idx < total_len:
-                    # BM25で直接スコアを算出
-                    bm25_sim = self.bm25.get_score(live_tokens, target_idx)
-                    history_score_sum += bm25_sim * decay_weights[k]
+            memory_history = previous_user_history(idx, limit=5)
+            history_score = 0.0
+            matched = min(len(live_history_tokens), len(memory_history), len(decay_weights))
+            for k in range(matched):
+                query_tokens = live_history_tokens[k]
+                if not query_tokens:
+                    continue
+                # 新しい履歴ほど大きな重み。候補の直前から順に対応させる。
+                memory_pos = idx - 1
+                seen = 0
+                while memory_pos >= 0 and seen <= k:
+                    entry = sentences[memory_pos]
+                    if not is_system_or_marker(entry):
+                        speaker = str(entry[1])
+                        if (speaker not in bot_names and not speaker.startswith("!input-")
+                                and "!system" not in speaker):
+                            if seen == k:
+                                break
+                            seen += 1
+                    memory_pos -= 1
+                if memory_pos >= 0:
+                    history_score += self.bm25.get_score(query_tokens, memory_pos) * decay_weights[k]
 
-            history_match_bonus = history_score_sum * 0.3  # 重み全体調整
+            scored.append({
+                "idx": idx,
+                "text": text_score,
+                "context": context_score,
+                "history": history_score,
+                "good": self._has_good_tag(idx),
+            })
 
-            final_score = text_score + capped_context + history_match_bonus
-            scored_candidates.append((final_score, idx))
-
-        scored_candidates.sort(key=lambda item: item[0], reverse=True)
-
-        if not scored_candidates:
+        if not scored:
             return None
 
-        # 1位と2位のスコア差をチェック
-        best_final_score, best_b, best_has_good = scored_candidates[0][0], scored_candidates[0][1], self._has_good_tag(scored_candidates[0][1])
-        
-        use_random = False
-        if len(scored_candidates) >= 2:
-            score_diff = scored_candidates[0][0] - scored_candidates[1][0]
-            if score_diff < 0.3:
-                use_random = True
+        # 特徴ごとに候補集合内で0〜1に正規化し、尺度の違うBM25値を直接足さない。
+        def normalize(values):
+            lo, hi = min(values), max(values)
+            if hi - lo <= 1e-12:
+                return [0.0] * len(values)
+            return [(v - lo) / (hi - lo) for v in values]
 
-        if use_random:
-            top_candidates_for_rand = scored_candidates[:5]
-            min_score = top_candidates_for_rand[-1][0]
-            weights = []
-            for score, idx in top_candidates_for_rand:
-                base_weight = max(0.001, score - min_score + 1.0)
-                if self._has_good_tag(idx):
-                    base_weight *= 1.5
-                weights.append(base_weight)
+        text_norm = normalize([item["text"] for item in scored])
+        context_norm = normalize([item["context"] for item in scored])
+        history_norm = normalize([item["history"] for item in scored])
 
-            clean_candidates = [(score, idx) for score, idx in top_candidates_for_rand]
-            chosen = random.choices(clean_candidates, weights=weights, k=1)[0]
-            best_final_score, best_b = chosen
-        else:
-            best_final_score, best_b = scored_candidates[0][0], scored_candidates[0][1]
+        for i, item in enumerate(scored):
+            item["final"] = (
+                0.72 * text_norm[i]
+                + 0.18 * context_norm[i]
+                + 0.10 * history_norm[i]
+                + (0.04 if item["good"] else 0.0)
+            )
 
-        if best_b is not None:
-            is_good_mark = " [★good優遇]" if self._has_good_tag(best_b) else ""
-            print(f"類似: {self.memory['sentence'][best_b][0]}, idx: {best_b}, FinalScore: {best_final_score:.3f}{is_good_mark}")
-            print(f"返信: {self.memory['sentence'][best_b+1][0]}, idx: {best_b+1}")
-            self.last_input_similar = self.memory['sentence'][best_b][0]
-            self.last_input_similar_user = self.memory['sentence'][best_b][1]
-            self.heart = best_b + 1
-            self.last_bot_base_user = self.memory['sentence'][best_b+1][1]
-            self.last_bot_base = self.memory['sentence'][best_b+1][0]
-            return self.memory['sentence'][best_b+1][0]
+        scored.sort(key=lambda item: item["final"], reverse=True)
 
-        return None
+        # 低い絶対スコアしかないときは、force=Falseなら返信しない。
+        # 正規化値は候補間の相対値なので、元のBM25スコアでも最低限の関連性を確認する。
+        if not force and scored[0]["text"] <= 0.01:
+            return None
+
+        # 上位候補がほぼ同点なら、上位3件の範囲で品質寄りの重み付き抽選。
+        best = scored[0]
+        if len(scored) >= 2 and best["final"] - scored[1]["final"] < 0.035:
+            pool = scored[:min(3, len(scored))]
+            floor = min(item["final"] for item in pool)
+            weights = [max(0.05, item["final"] - floor + 0.15) for item in pool]
+            chosen = random.choices(pool, weights=weights, k=1)[0]
+            # 低スコアの候補を選んだ場合も、選択された候補の値を一貫して使う。
+            best = chosen
+
+        best_idx = best["idx"]
+        response = sentences[best_idx + 1]
+        is_good_mark = " [★good優遇]" if best["good"] else ""
+        print(f"類似: {sentences[best_idx][0]}, idx: {best_idx}, FinalScore: {best['final']:.3f}{is_good_mark}")
+        print(f"返信: {response[0]}, idx: {best_idx + 1}")
+
+        self.last_input_similar = sentences[best_idx][0]
+        self.last_input_similar_user = sentences[best_idx][1]
+        self.heart = best_idx + 1
+        self.last_bot_base_user = response[1]
+        self.last_bot_base = response[0]
+        return response[0]
 
 
     def record(self):
