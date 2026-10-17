@@ -697,7 +697,7 @@ class Himawaria:
         self.word_replacer_memory_before = self.word_replacer_memory_before[-limit:]
 
         result = self.replaceWords(result, self.word_replacer_memory_after, self.word_replacer_memory_before)
-
+        result = result.replace("[YOU]", self.last_user)
 
         self.memory["word_replacer_memory_after"] = self.word_replacer_memory_after
         self.memory["word_replacer_memory_before"] = self.word_replacer_memory_before
