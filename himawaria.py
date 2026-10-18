@@ -440,9 +440,11 @@ class Himawaria:
             if score > 0.01:
                 candidates.append((score, idx))
 
-        if not candidates and force:
-            candidates = [(0.0, idx) for idx in range(total_len - 1) if valid_pair(idx)]
+        # 関連する候補が見つからない場合、force=Trueでも無関係な記憶を
+        # 全件候補に戻さない。ゼロスコアの候補を文脈・goodタグだけで選ぶと、
+        # 「？」のような入力に対して無関係な返信を生成してしまう。
         if not candidates:
+            print(f"検索候補なし: 入力とのBM25関連度が閾値以下です (force={force})")
             return None
 
         # ライブ履歴から「現在の入力より前」のユーザー発言のみを取得。
@@ -557,9 +559,14 @@ class Himawaria:
 
         scored.sort(key=lambda item: item["final"], reverse=True)
 
-        # 低い絶対スコアしかないときは、force=Falseなら返信しない。
-        # 正規化値は候補間の相対値なので、元のBM25スコアでも最低限の関連性を確認する。
-        if not force and scored[0]["text"] <= 0.01:
+        # 正規化値は候補間の相対値にすぎないため、最終スコアだけでなく
+        # 入力そのものとのBM25関連度を必ず確認する。force=Trueでもここは迂回させない。
+        # これにより、文脈スコアや !good の加点だけで無関係な返信が選ばれるのを防ぐ。
+        if scored[0]["text"] <= 0.01:
+            print(
+                f"返信見送り: 入力とのBM25スコアが不足 "
+                f"(score={scored[0]['text']:.4f}, force={force})"
+            )
             return None
 
         # 上位候補がほぼ同点なら、上位3件の範囲で品質寄りの重み付き抽選。
@@ -575,7 +582,12 @@ class Himawaria:
         best_idx = best["idx"]
         response = sentences[best_idx + 1]
         is_good_mark = " [★good優遇]" if best["good"] else ""
-        print(f"類似: {sentences[best_idx][0]}, idx: {best_idx}, FinalScore: {best['final']:.3f}{is_good_mark}")
+        print(
+            f"類似: {sentences[best_idx][0]}, idx: {best_idx}, "
+            f"BM25: {best['text']:.4f}, context: {best['context']:.4f}, "
+            f"history: {best['history']:.4f}, FinalScore: {best['final']:.3f}"
+            f"{is_good_mark}, force={force}"
+        )
         print(f"返信: {response[0]}, idx: {best_idx + 1}")
 
         self.last_input_similar = sentences[best_idx][0]
