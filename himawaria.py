@@ -204,6 +204,14 @@ class Himawaria:
                 json.dump(self.memory, f, ensure_ascii=False, indent=4, sort_keys=True, separators=(',', ': '))
         self.heart = len(self.memory["sentence"]) - 1
 
+        try:
+            with open(self.direc+"/chara_style.txt", "r", encoding="utf8") as f:
+                self.chara_style = f.read()
+        except:
+            with open(self.direc+"/chara_style.txt", "w", encoding="utf8") as f:
+                f.write("")
+                self.chara_style = ""
+
         with open(self.direc+"/memory_backup.json", "w", encoding="utf8") as f:
             json.dump(self.memory, f, ensure_ascii=False, indent=4, sort_keys=True, separators=(',', ': '))
 
@@ -489,6 +497,7 @@ class Himawaria:
                         break
             return history
 
+        chara_style_query = BM25Searcher.tokenize(self.chara_style)
         scored = []
         for text_score, idx in candidates:
             # 文脈スコアは入力単体より弱く扱い、極端な加点を避ける。
@@ -527,12 +536,14 @@ class Himawaria:
                 if memory_pos >= 0:
                     history_score += self.bm25.get_score(query_tokens, memory_pos) * decay_weights[k]
 
+            chara_style_score = self.bm25.get_score(chara_style_query, idx)
             scored.append({
                 "idx": idx,
                 "text": text_score,
                 "context": context_score,
                 "history": history_score,
                 "good": self._has_good_tag(idx),
+                "chara_style": chara_style_score,
             })
 
         if not scored:
@@ -548,6 +559,7 @@ class Himawaria:
         text_norm = normalize([item["text"] for item in scored])
         context_norm = normalize([item["context"] for item in scored])
         history_norm = normalize([item["history"] for item in scored])
+        chara_style_norm = normalize([item["chara_style"] for item in scored])
 
         for i, item in enumerate(scored):
             item["final"] = (
@@ -555,6 +567,7 @@ class Himawaria:
                 + 0.18 * context_norm[i]
                 + 0.10 * history_norm[i]
                 + (0.04 if item["good"] else 0.0)
+                + 0.02 * chara_style_norm[i]
             )
 
         scored.sort(key=lambda item: item["final"], reverse=True)

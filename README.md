@@ -39,4 +39,5 @@ botに「アンピン」というと、チャンネルを動けるようにな�
 3. ```pip install rapidfuzz```
 4. ```cp sample mybot```
 5. mybot/settings.jsonを設定
-6. ```python disc.py mybot```
+6. mybot/chara_styleでキャラクターの口調の例をテキストファイルで指定
+7. ```python disc.py mybot```
