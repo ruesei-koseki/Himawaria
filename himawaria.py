@@ -7,7 +7,28 @@ import difflib
 from collections import Counter
 from rapidfuzz.distance import Levenshtein
 
+
+# ---------------------------------------------------------------------------
+# 検索・会話処理の調整値
+# 動作を調整するときは、まずこの定数を変更し、looking() 内に数値を散在させない。
+# ---------------------------------------------------------------------------
+BM25_K1 = 1.5
+BM25_B = 0.75
+MIN_BM25_CANDIDATE_SCORE = 0.01
+GOOD_TAG_MULTIPLIER = 1.15
+TEXT_SCORE_WEIGHT = 0.72
+CONTEXT_SCORE_WEIGHT = 0.18
+HISTORY_SCORE_WEIGHT = 0.10
+GOOD_TAG_BONUS = 0.04
+# キャラクター口調は補助情報。入力内容の一致より強くならないよう、ごく小さくする。
+CHARA_STYLE_WEIGHT = 0.02
+NEAR_TIE_THRESHOLD = 0.035
+NEAR_TIE_POOL_SIZE = 3
+HISTORY_DECAY_WEIGHTS = (1.0, 0.5, 0.25, 0.125, 0.0625)
+
+
 class BM25Searcher:
+    """文字n-gramを使った簡易BM25検索器。fit()で索引を作り、get_score()で採点する。"""
     def __init__(self, k1=1.5, b=0.75):
         self.k1 = k1
         self.b = b
@@ -90,6 +111,7 @@ class BM25Searcher:
         return score
 
 class NgramTokenizer:
+    """文字の結合度を学習し、単語置換処理で使うトークナイザー。"""
     def __init__(self):
         self.char_counts = Counter()
         self.bigram_counts = Counter()
@@ -164,6 +186,11 @@ class NgramTokenizer:
         print(f"🚀 モデルを正常に読み込みました: {file_path}")
 
 class Himawaria:
+    """会話記憶の検索・学習・応答を管理するクラス。
+
+    memory.json の sentence は [発言, 話者] のペアを順に保持する。
+    looking() は候補検索と順位付けを行い、receive() は入力から応答までを管理する。
+    """
     def __init__(self, directory, maximum_word_replacer_memory=128, min_similarity_threshold=0.45):
         self.direc = directory
         self.maximum_word_replacer_memory = maximum_word_replacer_memory
@@ -230,6 +257,9 @@ class Himawaria:
                 self.tokenizer.train([sen[1]])
         self.heart = random.randint(0, max(0, len(self.memory["sentence"]) - 1))
 
+    # ------------------------------------------------------------------
+    # 学習・保存
+    # ------------------------------------------------------------------
     def learnSentence(self, x, u, save=True, directLearning=False):
         if u not in self.settings["mynames"].split("|") and directLearning and u not in ["!input", "!output", "!system"]:
             u = "!input-"+u
@@ -284,6 +314,9 @@ class Himawaria:
                 next_sen[1] != "!" and
                 "!system" not in next_sen[1])
 
+    # ------------------------------------------------------------------
+    # 応答後の単語置換
+    # ------------------------------------------------------------------
     def replaceWords(self, x, inputs, inputsHeart):
         """
         単語置換処理: 助詞や短いトークンの破壊的・誤認置換を抑制し、安全な置換を実施
@@ -349,6 +382,9 @@ class Himawaria:
                         break
             return flag
 
+    # ------------------------------------------------------------------
+    # 検索候補の生成・採点
+    # ------------------------------------------------------------------
     def update_bm25_index(self):
         """各発言をシンプルにインデックス化する"""
         sentences = self.memory["sentence"]
@@ -360,7 +396,7 @@ class Himawaria:
             # 余計な過去ログの連結をやめ、その発言単体をドキュメントにする
             corpus.append(f"{curr_tag}{curr_text}")
 
-        self.bm25 = BM25Searcher(k1=1.5, b=0.75)
+        self.bm25 = BM25Searcher(k1=BM25_K1, b=BM25_B)
         self.bm25.fit(corpus)
 
     def _is_duplicate(self, reply, last_input, last_bot_resp, last_bot_base):
@@ -385,6 +421,16 @@ class Himawaria:
                 if self.memory["sentence"][idx + offset][0] == "!good":
                     return True
         return False
+
+    @staticmethod
+    def _normalize_scores(values):
+        """スコア列を0〜1に正規化する。同点しかない場合は全件0を返す。"""
+        if not values:
+            return []
+        low, high = min(values), max(values)
+        if high - low <= 1e-12:
+            return [0.0] * len(values)
+        return [(value - low) / (high - low) for value in values]
 
     def looking(self, x, u, reply=True, force=False):
         """現在の入力に近い過去発言を検索し、その次の発言を返す。"""
@@ -444,8 +490,8 @@ class Himawaria:
                 continue
             score = self.bm25.get_score(tokens_query, idx)
             if self._has_good_tag(idx):
-                score *= 1.15
-            if score > 0.01:
+                score *= GOOD_TAG_MULTIPLIER
+            if score > MIN_BM25_CANDIDATE_SCORE:
                 candidates.append((score, idx))
 
         # 関連する候補が見つからない場合、force=Trueでも無関係な記憶を
@@ -476,7 +522,7 @@ class Himawaria:
             live_history = []
 
         live_history_tokens = [BM25Searcher.tokenize(t) for t in live_history]
-        decay_weights = (1.0, 0.5, 0.25, 0.125, 0.0625)
+        decay_weights = HISTORY_DECAY_WEIGHTS
 
         # 候補ごとに、候補発言より前にあるユーザー発言列との一致を測る。
         def previous_user_history(target_idx, limit=5):
@@ -536,7 +582,7 @@ class Himawaria:
                 if memory_pos >= 0:
                     history_score += self.bm25.get_score(query_tokens, memory_pos) * decay_weights[k]
 
-            chara_style_score = self.bm25.get_score(chara_style_query, idx)
+            chara_style_score = self.bm25.get_score(chara_style_query, idx+1)
             scored.append({
                 "idx": idx,
                 "text": text_score,
@@ -549,25 +595,22 @@ class Himawaria:
         if not scored:
             return None
 
-        # 特徴ごとに候補集合内で0〜1に正規化し、尺度の違うBM25値を直接足さない。
-        def normalize(values):
-            lo, hi = min(values), max(values)
-            if hi - lo <= 1e-12:
-                return [0.0] * len(values)
-            return [(v - lo) / (hi - lo) for v in values]
-
-        text_norm = normalize([item["text"] for item in scored])
-        context_norm = normalize([item["context"] for item in scored])
-        history_norm = normalize([item["history"] for item in scored])
-        chara_style_norm = normalize([item["chara_style"] for item in scored])
+        # 各特徴量はBM25値の尺度が異なるため、候補集合内で0〜1に正規化してから合成する。
+        # 注意: この正規化値は候補間の相対値であり、絶対的な確信度ではない。
+        text_norm = self._normalize_scores([item["text"] for item in scored])
+        context_norm = self._normalize_scores([item["context"] for item in scored])
+        history_norm = self._normalize_scores([item["history"] for item in scored])
+        chara_style_norm = self._normalize_scores([item["chara_style"] for item in scored])
 
         for i, item in enumerate(scored):
+            # 入力との一致を主軸にし、文脈・履歴・口調は補助的に加点する。
+            # !good は既存の品質優遇機構として固定ボーナスを与える。
             item["final"] = (
-                0.72 * text_norm[i]
-                + 0.18 * context_norm[i]
-                + 0.10 * history_norm[i]
-                + (0.04 if item["good"] else 0.0)
-                + 0.02 * chara_style_norm[i]
+                TEXT_SCORE_WEIGHT * text_norm[i]
+                + CONTEXT_SCORE_WEIGHT * context_norm[i]
+                + HISTORY_SCORE_WEIGHT * history_norm[i]
+                + (GOOD_TAG_BONUS if item["good"] else 0.0)
+                + CHARA_STYLE_WEIGHT * chara_style_norm[i]
             )
 
         scored.sort(key=lambda item: item["final"], reverse=True)
@@ -584,8 +627,9 @@ class Himawaria:
 
         # 上位候補がほぼ同点なら、上位3件の範囲で品質寄りの重み付き抽選。
         best = scored[0]
-        if len(scored) >= 2 and best["final"] - scored[1]["final"] < 0.035:
-            pool = scored[:min(3, len(scored))]
+        if (len(scored) >= 2 and
+                best["final"] - scored[1]["final"] < NEAR_TIE_THRESHOLD):
+            pool = scored[:min(NEAR_TIE_POOL_SIZE, len(scored))]
             floor = min(item["final"] for item in pool)
             weights = [max(0.05, item["final"] - floor + 0.15) for item in pool]
             chosen = random.choices(pool, weights=weights, k=1)[0]
@@ -598,7 +642,8 @@ class Himawaria:
         print(
             f"類似: {sentences[best_idx][0]}, idx: {best_idx}, "
             f"BM25: {best['text']:.4f}, context: {best['context']:.4f}, "
-            f"history: {best['history']:.4f}, FinalScore: {best['final']:.3f}"
+            f"history: {best['history']:.4f}, style: {best['chara_style']:.4f}, "
+            f"FinalScore: {best['final']:.3f}"
             f"{is_good_mark}, force={force}"
         )
         print(f"返信: {response[0]}, idx: {best_idx + 1}")
@@ -611,6 +656,9 @@ class Himawaria:
         return response[0]
 
 
+    # ------------------------------------------------------------------
+    # 会話フロー
+    # ------------------------------------------------------------------
     def record(self):
         if self.current_voice:
             self.learnSentence(self.current_voice, "!")
