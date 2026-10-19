@@ -111,78 +111,156 @@ class BM25Searcher:
         return score
 
 class NgramTokenizer:
-    """文字の結合度を学習し、単語置換処理で使うトークナイザー。"""
+    """コーパス中の文字頻度からPMIを学習し、文字列を分割するトークナイザー。"""
     def __init__(self):
         self.char_counts = Counter()
         self.bigram_counts = Counter()
+        # 互換性のため保持するが、自動閾値方式では分割判断に使わない。
         self.forced_words = set()
-        
-    def train(self, corpus_list):
-        """1文字と2文字の出現頻度をカウント"""
+        self._pmi_threshold_cache = None
+
+    def train(self, corpus_list, reset=False):
+        """コーパスから1文字・隣接2文字の頻度を集計する。
+
+        reset=True なら全件を再構築し、通常は既存統計に追加学習する。
+        """
+        if reset:
+            self.char_counts = Counter()
+            self.bigram_counts = Counter()
         for sentence in corpus_list:
             if not sentence:
                 continue
             self.char_counts.update(sentence)
-            bigrams = [sentence[i:i+2] for i in range(len(sentence)-1)]
-            self.bigram_counts.update(bigrams)
+            self.bigram_counts.update(
+                sentence[i:i + 2] for i in range(len(sentence) - 1)
+            )
+        self._pmi_threshold_cache = None
 
     def register_words(self, words_list):
-        """分割してほしくない単語を辞書として登録する"""
+        """旧APIとの互換性のため登録を受け付ける（自動分割では使用しない）。"""
         self.forced_words.update(words_list)
 
     def _get_cohesion_score(self, c1, c2):
-        """2文字の結合度スコア（条件付き確率）"""
+        """隣接文字ペアのPMIを返す。値が大きいほど偶然以上の結合を示す。"""
         bigram = c1 + c2
-        if self.char_counts[c1] == 0 or self.bigram_counts[bigram] == 0:
-            return 0.0
-        return self.bigram_counts[bigram] / self.char_counts[c1]
+        count_a = self.char_counts[c1]
+        count_b = self.char_counts[c2]
+        count_ab = self.bigram_counts[bigram]
+        total_chars = sum(self.char_counts.values())
+        total_bigrams = sum(self.bigram_counts.values())
 
-    def tokenize(self, text, drop_threshold=0.3):
-        """結合度スコアがしきい値より低いタイミングで区切る"""
+        if not count_a or not count_b or not count_ab or not total_chars or not total_bigrams:
+            return 0.0
+
+        p_a = count_a / total_chars
+        p_b = count_b / total_chars
+        p_ab = count_ab / total_bigrams
+        return math.log(p_ab / (p_a * p_b))
+
+    def _get_pmi_threshold(self):
+        """実コーパスのPMI分布から、重み付き大津法で分割閾値を求める。
+
+        各bigramのPMIを値、出現回数を重みとして、低結合群と高結合群の
+        クラス間分散が最大になる境界を選ぶ。結果は統計が変わるまでキャッシュする。
+        """
+        if self._pmi_threshold_cache is not None:
+            return self._pmi_threshold_cache
+
+        total_chars = sum(self.char_counts.values())
+        total_bigrams = sum(self.bigram_counts.values())
+        if not total_chars or not total_bigrams or not self.bigram_counts:
+            self._pmi_threshold_cache = 0.0
+            return self._pmi_threshold_cache
+
+        scored_pairs = []
+        for bigram, count_ab in self.bigram_counts.items():
+            c1, c2 = bigram[0], bigram[1]
+            count_a = self.char_counts[c1]
+            count_b = self.char_counts[c2]
+            if not count_a or not count_b or count_ab <= 0:
+                continue
+            p_a = count_a / total_chars
+            p_b = count_b / total_chars
+            p_ab = count_ab / total_bigrams
+            pmi = math.log(p_ab / (p_a * p_b))
+            scored_pairs.append((pmi, count_ab))
+
+        if len(scored_pairs) < 2:
+            threshold = scored_pairs[0][0] if scored_pairs else 0.0
+            self._pmi_threshold_cache = threshold
+            return threshold
+
+        scored_pairs.sort(key=lambda item: item[0])
+        total_weight = sum(weight for _, weight in scored_pairs)
+        weighted_sum = sum(score * weight for score, weight in scored_pairs)
+        total_mean = weighted_sum / total_weight
+
+        lower_weight = 0
+        lower_sum = 0.0
+        best_variance = -1.0
+        threshold = scored_pairs[0][0]
+        for i in range(len(scored_pairs) - 1):
+            score, weight = scored_pairs[i]
+            lower_weight += weight
+            lower_sum += score * weight
+            upper_weight = total_weight - lower_weight
+            if upper_weight <= 0 or lower_weight <= 0:
+                continue
+
+            lower_mean = lower_sum / lower_weight
+            upper_mean = (weighted_sum - lower_sum) / upper_weight
+            between_variance = (
+                lower_weight * (lower_mean - total_mean) ** 2
+                + upper_weight * (upper_mean - total_mean) ** 2
+            )
+            next_score = scored_pairs[i + 1][0]
+            if between_variance > best_variance and score < next_score:
+                best_variance = between_variance
+                threshold = (score + next_score) / 2.0
+
+        self._pmi_threshold_cache = threshold
+        return threshold
+
+    def tokenize(self, text, drop_threshold=None):
+        """PMIが自動閾値未満なら区切る。数値指定時は手動閾値を優先する。"""
+        if not text:
+            return []
         if len(text) <= 1:
             return [text]
-            
+
+        threshold = self._get_pmi_threshold() if drop_threshold is None else drop_threshold
         words = []
         current_word = text[0]
-        
+
         for i in range(len(text) - 1):
-            c1, c2 = text[i], text[i+1]
-            candidate = current_word + c2
-            
-            is_part_of_forced_word = any(
-                fw.startswith(candidate) for fw in self.forced_words
-            )
-            
-            if is_part_of_forced_word:
-                current_word = candidate
+            c1, c2 = text[i], text[i + 1]
+            score = self._get_cohesion_score(c1, c2)
+            if score < threshold:
+                words.append(current_word)
+                current_word = c2
             else:
-                score = self._get_cohesion_score(c1, c2)
-                if score < drop_threshold:
-                    words.append(current_word)
-                    current_word = c2
-                else:
-                    current_word += c2
-                
+                current_word += c2
+
         if current_word:
             words.append(current_word)
-            
         return words
-    
+
     def save(self, file_path):
-        """学習済みの統計データをファイルに保存する"""
+        """学習済み頻度データを保存する。"""
         self_to_save = {
             'char_counts': self.char_counts,
-            'bigram_counts': self.bigram_counts
+            'bigram_counts': self.bigram_counts,
         }
         with open(file_path, 'wb') as f:
             pickle.dump(self_to_save, f)
 
     def load(self, file_path):
-        """保存されたファイルから統計データを復元する"""
+        """保存データから頻度を復元し、PMI閾値キャッシュを破棄する。"""
         with open(file_path, 'rb') as f:
             loaded_self = pickle.load(f)
         self.char_counts = loaded_self['char_counts']
         self.bigram_counts = loaded_self['bigram_counts']
+        self._pmi_threshold_cache = None
         print(f"🚀 モデルを正常に読み込みました: {file_path}")
 
 class Himawaria:
@@ -249,12 +327,18 @@ class Himawaria:
         self.word_replacer_memory_before = self.memory["word_replacer_memory_before"]
 
         self.tokenizer = NgramTokenizer()
+        # 保存済みモデルが古い／壊れている場合も確実に回復できるよう、
+        # 起動時は memory.json の全会話から統計を再構築する。
+        corpus = []
+        for pair in self.memory.get("sentence", []):
+            if isinstance(pair, (list, tuple)):
+                corpus.extend(text for text in pair[:2] if isinstance(text, str) and text)
+        self.tokenizer.train(corpus, reset=True)
+        # 再構築した統計を保存。保存失敗は起動自体を止めない。
         try:
-            self.tokenizer.load(self.direc+"/tokenizer.model")
-        except:
-            for sen in self.memory["sentence"]:
-                self.tokenizer.train([sen[0]])
-                self.tokenizer.train([sen[1]])
+            self.tokenizer.save(self.direc + "/tokenizer.model")
+        except OSError as exc:
+            print(f"⚠ tokenizer.model を保存できません: {exc}")
         self.heart = random.randint(0, max(0, len(self.memory["sentence"]) - 1))
 
     # ------------------------------------------------------------------
@@ -322,13 +406,13 @@ class Himawaria:
         単語置換処理: 助詞や短いトークンの破壊的・誤認置換を抑制し、安全な置換を実施
         """
         replacements = []
-        w3 = self.tokenizer.tokenize(x, drop_threshold=0.4)
+        w3 = self.tokenizer.tokenize(x)
         
         for i in range(len(inputs)):
             if not inputs[i] or not inputsHeart[i]:
                 continue
-            w1 = self.tokenizer.tokenize(inputs[i], drop_threshold=0.4)
-            w2 = self.tokenizer.tokenize(inputsHeart[i], drop_threshold=0.4)
+            w1 = self.tokenizer.tokenize(inputs[i])
+            w2 = self.tokenizer.tokenize(inputsHeart[i])
 
             diffs = list(difflib.ndiff(w2, w1))
             old, new = "", ""
@@ -582,7 +666,7 @@ class Himawaria:
                 if memory_pos >= 0:
                     history_score += self.bm25.get_score(query_tokens, memory_pos) * decay_weights[k]
 
-            chara_style_score = self.bm25.get_score(chara_style_query, idx+1)
+            chara_style_score = self.bm25.get_score(chara_style_query, idx)
             scored.append({
                 "idx": idx,
                 "text": text_score,
