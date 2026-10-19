@@ -256,22 +256,6 @@ class Himawaria:
                 self.tokenizer.train([sen[0]])
                 self.tokenizer.train([sen[1]])
         self.heart = random.randint(0, max(0, len(self.memory["sentence"]) - 1))
-
-        """
-        sentences = self.memory["sentence"]
-        corpus = []
-        
-        for i in range(len(sentences)):
-            curr_text, speaker = sentences[i][0], sentences[i][1]
-            curr_tag = "[!]" if speaker == "!" else f"[{speaker}]"
-            # 余計な過去ログの連結をやめ、その発言単体をドキュメントにする
-            corpus.append(f"{curr_tag}{curr_text}")
-
-        self.bm25 = BM25Searcher(k1=BM25_K1, b=BM25_B)
-        self.bm25.fit(corpus)
-        print(f"NgramTokenizer: {self.tokenizer.tokenize("みんなが幼児化しちゃった件")}")
-        print(f"BM25Searcher: {self.bm25.tokenize("みんなが幼児化しちゃった件")}")
-        """
         
     # ------------------------------------------------------------------
     # 学習・保存
