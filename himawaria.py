@@ -17,7 +17,7 @@ BM25_B = 0.75
 MIN_BM25_CANDIDATE_SCORE = 0.01
 GOOD_TAG_MULTIPLIER = 1.15
 TEXT_SCORE_WEIGHT = 0.72
-CONTEXT_SCORE_WEIGHT = 0.18
+CONTEXT_SCORE_WEIGHT = 0.0
 HISTORY_SCORE_WEIGHT = 0.10
 GOOD_TAG_BONUS = 0.04
 # キャラクター口調は補助情報。入力内容の一致より強くならないよう、ごく小さくする。
@@ -354,8 +354,7 @@ class Himawaria:
             if len(token) <= 1:
                 continue
             for old, new in reversed(replacements):
-                sim = Levenshtein.normalized_similarity(token, old)
-                if sim >= 0.85:
+                if old == token:
                     print(f"単語置換: {token} ({old}) => {new}")
                     res_tokens[idx] = new
                     break
