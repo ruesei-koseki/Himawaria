@@ -257,6 +257,22 @@ class Himawaria:
                 self.tokenizer.train([sen[1]])
         self.heart = random.randint(0, max(0, len(self.memory["sentence"]) - 1))
 
+        """
+        sentences = self.memory["sentence"]
+        corpus = []
+        
+        for i in range(len(sentences)):
+            curr_text, speaker = sentences[i][0], sentences[i][1]
+            curr_tag = "[!]" if speaker == "!" else f"[{speaker}]"
+            # 余計な過去ログの連結をやめ、その発言単体をドキュメントにする
+            corpus.append(f"{curr_tag}{curr_text}")
+
+        self.bm25 = BM25Searcher(k1=BM25_K1, b=BM25_B)
+        self.bm25.fit(corpus)
+        print(f"NgramTokenizer: {self.tokenizer.tokenize("みんなが幼児化しちゃった件")}")
+        print(f"BM25Searcher: {self.bm25.tokenize("みんなが幼児化しちゃった件")}")
+        """
+        
     # ------------------------------------------------------------------
     # 学習・保存
     # ------------------------------------------------------------------
@@ -322,6 +338,7 @@ class Himawaria:
         単語置換処理: 助詞や短いトークンの破壊的・誤認置換を抑制し、安全な置換を実施
         """
         replacements = []
+        used = []
         w3 = self.tokenizer.tokenize(x, drop_threshold=0.4)
         
         for i in range(len(inputs)):
@@ -346,15 +363,13 @@ class Himawaria:
             if (old or new) and len(old) >= 2:
                 replacements.append((old, new))
                 
-        # 長い置換元から先に適用する
-        replacements.sort(key=lambda pair: len(pair[0]), reverse=True)
-
         res_tokens = list(w3)
         for idx, token in enumerate(res_tokens):
             if len(token) <= 1:
                 continue
             for old, new in reversed(replacements):
-                if old == token:
+                sim = Levenshtein.normalized_similarity(token, old)
+                if sim >= 0.85:
                     print(f"単語置換: {token} ({old}) => {new}")
                     res_tokens[idx] = new
                     break
@@ -449,7 +464,10 @@ class Himawaria:
                 len(self.bm25.doc_freqs) != total_len):
             self.update_bm25_index()
 
-        tokens_query = BM25Searcher.tokenize(x)
+        # BM25のクエリ側で同じn-gramを重複加点しない。
+        # 日本語の短い文字列では重複トークンがスコアを不自然に押し上げるため、
+        # まずユニークなn-gramで検索する。
+        tokens_query = list(dict.fromkeys(BM25Searcher.tokenize(x)))
         if not tokens_query:
             return None
 
@@ -485,11 +503,28 @@ class Himawaria:
             return True
 
         # 現在の入力に関連する過去発言を検索。
-        # force=Trueでも無効な返信やシステム用タグを候補に戻さない。
+        # BM25は一部のn-gramだけが一致しても高得点になりうるため、
+        # 入力n-gramのどれだけが候補発言に含まれるかも確認する。
+        # force=Trueでも、この関連性フィルターは迂回させない。
         candidates = []
+        min_query_matches = min(2, len(set(tokens_query)))
         for idx in range(total_len - 1):
             if not valid_pair(idx):
                 continue
+
+            doc_tokens = set(self.bm25.docs_tokens[idx])
+            query_token_set = set(tokens_query)
+            matched_tokens = query_token_set.intersection(doc_tokens)
+            match_count = len(matched_tokens)
+            coverage = match_count / max(1, len(query_token_set))
+
+            # 長い入力が「ちゃ」など1個の偶然の一致で通過するのを防ぐ。
+            # 2文字以下の入力は1トークンしかないため、完全一致相当の条件で判定。
+            if match_count < min_query_matches:
+                continue
+            if len(query_token_set) >= 4 and coverage < 0.20:
+                continue
+
             score = self.bm25.get_score(tokens_query, idx)
             if self._has_good_tag(idx):
                 score *= GOOD_TAG_MULTIPLIER
