@@ -11,8 +11,10 @@ import himawaria
 himawaria_instance = None
 if len(sys.argv) > 1 and sys.argv[1]:
     himawaria_instance = himawaria.Himawaria(sys.argv[1])
+    himawaria.setup_logging() 
 else:
     himawaria_instance = himawaria.Himawaria("main")
+    himawaria.setup_logging() 
 time.sleep(1)
 
 # グローバル変数の初期化
@@ -124,7 +126,7 @@ async def speak(result):
                     himawaria_instance.record()
                 else:
                     hold_message = [Message_text, "!"]
-                nxt = himawaria_instance.nextSpeak()
+                nxt = himawaria_instance.next_speak()
                 if nxt:
                     print("続きを返信します")
                     await speak(nxt)
@@ -167,7 +169,7 @@ async def on_message(message: Message):
         if message.channel != channel:
             try:
                 print("チャンネルを移動しました: {}".format(message.channel.name))
-                himawaria_instance.receive("!command fluxMove {} | チャンネル名: {}, カテゴリー: {}, トピック: {}".format(message.channel.id, message.channel.name, message.channel.category, message.channel.topic).replace("\n", " "), username)
+                himawaria_instance.receive("!command fluxMove {} | チャンネル名: {}, トピック: {}".format(message.channel.id, message.channel.name, message.channel.topic).replace("\n", " "), username)
             except:
                 print("チャンネルを移動しました: {}のDM".format(username))
                 himawaria_instance.receive("!command fluxMove {} | 誰のDMか: {}".format(message.channel.id, username).replace("\n", " "), username)
@@ -190,19 +192,19 @@ async def on_message(message: Message):
                 if taisho == "" or taisho in himawaria_instance.get_settings()["mynames"]:
                     split_part = part.split("===")
                     if split_part[0] == "" and lastMessage:
-                        himawaria_instance.learnSentence(lastMessage[0], "!input", directLearning=True)
-                        himawaria_instance.learnSentence(split_part[1], "!output", directLearning=True)
+                        himawaria_instance.learn_sentence(lastMessage[0], "!input", direct_learning=True)
+                        himawaria_instance.learn_sentence(split_part[1], "!output", direct_learning=True)
                     else:
-                        himawaria_instance.learnSentence(split_part[0], "!input", directLearning=True)
-                        himawaria_instance.learnSentence(split_part[1], "!output", directLearning=True)
+                        himawaria_instance.learn_sentence(split_part[0], "!input", direct_learning=True)
+                        himawaria_instance.learn_sentence(split_part[1], "!output", direct_learning=True)
                 ff = True
         if bool(re.search("(.*?)\n==>\n(.*?)", message.content)):
             if taisho == "" or taisho in himawaria_instance.get_settings()["mynames"]:
-                himawaria_instance.learnSentence(message.content.split("\n==>\n")[0], "!input", directLearning=True)
-                himawaria_instance.learnSentence(message.content.split("\n==>\n")[1], "!output", directLearning=True)
+                himawaria_instance.learn_sentence(message.content.split("\n==>\n")[0], "!input", direct_learning=True)
+                himawaria_instance.learn_sentence(message.content.split("\n==>\n")[1], "!output", direct_learning=True)
             ff = True
         if ff:
-            himawaria_instance.learnSentence("!good", "!system", directLearning=True)
+            himawaria_instance.learn_sentence("!good", "!system", direct_learning=True)
             return
 
         pss = []
@@ -295,12 +297,12 @@ async def cron():
                 if len(messages) != 0:
                     if himawaria_instance.get_current_voice() != None:
                         if bool(re.search(himawaria_instance.get_settings()["mynames"], lastMessage[0])) or is_dm:
-                            result = himawaria_instance.speakFreely(is_active_learning=is_active_learning)
+                            result = himawaria_instance.speak_freely(is_active_learning=is_active_learning)
                             if result != None:
                                 await speak(result)
                         messages = []
                 if random.randint(0, 60*25) == 0 and himawaria_instance.get_current_voice() != None:
-                    result = himawaria_instance.speakFreely(is_active_learning=is_active_learning)
+                    result = himawaria_instance.speak_freely(is_active_learning=is_active_learning)
                     if result != None:
                         await speak(result)
             elif mode == 2:
@@ -321,7 +323,7 @@ async def cron():
                     else:
                         denominator = len(people)-1
                     if bool(re.search(himawaria_instance.get_settings()["mynames"], lastMessage[0])) or is_dm or ((not bool(re.search(aaa, lastMessage[0])) or aaa == "") and random.randint(0, denominator) == 0 and himawaria_instance.get_current_voice() != None):
-                        result = himawaria_instance.speakFreely(is_active_learning=is_active_learning)
+                        result = himawaria_instance.speak_freely(is_active_learning=is_active_learning)
                         if result != None:
                             await speak(result)
                     messages = []
@@ -343,7 +345,7 @@ async def cron():
                     else:
                         denominator = len(people)-2
                     if bool(re.search(himawaria_instance.get_settings()["mynames"], lastMessage[0])) or is_dm or ((not bool(re.search(aaa, lastMessage[0])) or aaa == "") and random.randint(0, denominator) == 0 and himawaria_instance.get_current_voice() != None):
-                        result = himawaria_instance.speakFreely(is_active_learning=is_active_learning)
+                        result = himawaria_instance.speak_freely(is_active_learning=is_active_learning)
                         if result != None:
                             await speak(result)
                     messages = []
@@ -361,7 +363,7 @@ async def cron():
                     himawaria_instance.receive(dt_now.strftime('%Y/%m/%d %H:%M:%S'), "!systemClock", is_active_learning=is_active_learning)
                 print("沈黙を検知")
                 if (mode == 2 and random.randint(0, 14) == 0) or (mode == 3 and random.randint(0, 11) == 0) or (mode == 1 and random.randint(0, 180) == 0):
-                    result = himawaria_instance.speakFreely(is_active_learning=is_active_learning)
+                    result = himawaria_instance.speak_freely(is_active_learning=is_active_learning)
                     if result != None:
                         await speak(result)
             

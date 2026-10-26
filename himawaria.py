@@ -1,204 +1,647 @@
-import json
-import random
-import pickle
-import math
-import re
+"""Himawaria: 会話記憶検索型の人工無能。
+
+過去の会話ログ(記憶)から、入力に最も近い発言の「次の発言」を返信として選ぶ。
+
+構成:
+    tokenize_ngrams      -- 文字n-gram分割 (TF-IDF用)
+    NgramTokenizer       -- 結合度ベースの簡易トークナイザー (単語置換用)
+    SelfSemanticLearner  -- 記憶内の共起から作るPPMI意味ベクトル
+    TfidfIndex           -- 転置索引つきTF-IDF索引 (増分更新対応)
+    Himawaria            -- 学習・検索・応答の本体
+"""
+from __future__ import annotations
+
 import difflib
+import heapq
+import json
+import logging
+import math
+import os
+import pickle
+import random
+import re
 from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Sequence
+
 from rapidfuzz.distance import Levenshtein
 
+logger = logging.getLogger(__name__)
+
+
+def setup_logging(
+    level: int = logging.INFO,
+    log_file: Path | str | None = None,
+    max_bytes: int = 5_000_000,
+    backup_count: int = 3,
+) -> None:
+    """ログの出力先を設定する。コンソールに出し、log_file を指定するとファイルにも残す。
+
+    ファイルは max_bytes ごとにローテーションし、backup_count 世代まで保持する。
+    何度呼んでも二重出力にならない。
+    """
+    from logging.handlers import RotatingFileHandler
+
+    root = logging.getLogger(__name__)
+    root.setLevel(level)
+    root.propagate = False
+    for handler in list(root.handlers):  # 再設定時に重複させない
+        root.removeHandler(handler)
+        handler.close()
+
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    root.addHandler(console)
+
+    if log_file is not None:
+        file_handler = RotatingFileHandler(
+            log_file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf8"
+        )
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
 
 # ---------------------------------------------------------------------------
-# 検索・会話処理の調整値
-# 動作を調整するときは、まずこの定数を変更し、looking() 内に数値を散在させない。
+# 定数
 # ---------------------------------------------------------------------------
-BM25_K1 = 1.5
-BM25_B = 0.75
-MIN_BM25_CANDIDATE_SCORE = 0.01
-GOOD_TAG_MULTIPLIER = 1.15
-TEXT_SCORE_WEIGHT = 0.72
-CONTEXT_SCORE_WEIGHT = 0.0
-HISTORY_SCORE_WEIGHT = 0.10
-GOOD_TAG_BONUS = 0.04
-# キャラクター口調は補助情報。入力内容の一致より強くならないよう、ごく小さくする。
-CHARA_STYLE_WEIGHT = 0.02
-NEAR_TIE_THRESHOLD = 0.035
-NEAR_TIE_POOL_SIZE = 3
-HISTORY_DECAY_WEIGHTS = (1.0, 0.5, 0.25, 0.125, 0.0625)
+SYSTEM_MARKERS = frozenset({"!good", "!bad"})
+BOT_SPEAKERS = frozenset({"!", "!output", "bot", "init"})
+BOT_OUTPUT_SPEAKERS = frozenset({"!", "!output"})
+RESERVED_SPEAKERS = frozenset({"!input", "!output", "!system"})
+
+MAX_SENTENCES = 1_600_000
+LOG_LIMIT = 9
+TOKENIZER_FILE = "tokenizer.json"
+LEGACY_TOKENIZER_FILE = "tokenizer.model"  # 旧pickle形式 (読み込みのみ対応)
+
+SEMANTIC_DROP_THRESHOLD = 0.4
+REPLACE_CHAR_SIMILARITY = 0.85
+REPLACE_SEMANTIC_SIMILARITY = 0.75
+DUPLICATE_SIMILARITY = 0.85
+
+_REPEAT_RE = re.compile(r"(.)\1{2,}")
+_DIGIT_SPLIT_RE = re.compile(r"(\d+)")
 
 
-class BM25Searcher:
-    """文字n-gramを使った簡易BM25検索器。fit()で索引を作り、get_score()で採点する。"""
-    def __init__(self, k1=1.5, b=0.75):
-        self.k1 = k1
-        self.b = b
-        self.doc_len = []
-        self.avgdl = 0
-        self.doc_freqs = []
-        self.idf = {}
-        self.corpus_size = 0
-        self.docs_tokens = []
+@dataclass(frozen=True)
+class SearchConfig:
+    """検索・スコアリングの調整値。"""
 
-    @staticmethod
-    def tokenize(text, n=2):
-        if not text:
-            return []
+    min_tfidf_candidate_score: float = 0.01
+    good_tag_multiplier: float = 1.15
+    text_score_weight: float = 0.72
+    context_score_weight: float = 0.0  # 0なら文脈スコアは計算自体をスキップ
+    history_score_weight: float = 0.10
+    good_tag_bonus: float = 0.04
+    chara_style_weight: float = 0.02
+    near_tie_threshold: float = 0.035
+    near_tie_pool_size: int = 3
+    history_decay_weights: tuple[float, ...] = (1.0, 0.5, 0.25, 0.125, 0.0625)
+    history_lookback: int = 100  # 履歴スコアで遡る記憶エントリ数の上限
+    min_query_matches: int = 2
+    min_coverage: float = 0.20  # 異なるトークンが4個以上のときだけ適用
+    min_text_score: float = 0.01
+    max_scored_candidates: int = 300  # TF-IDF上位だけを詳細採点する (0以下で無制限)
 
-        # 2文字以上の同じ文字の連続は「2文字」に圧縮する（例: "..." や "...." -> "..", "ーーー" -> "ーー"）
-        text = re.sub(r'(.)\1{2,}', r'\1\1', text)
 
-        tokens = []
-        parts = re.split(r'(\d+)', text)
-        for part in parts:
-            if not part:
-                continue
-            if part.isdigit():
-                tokens.append(part)
-            else:
-                if len(part) < n:
-                    tokens.append(part)
-                else:
-                    tokens.extend([part[i:i+n] for i in range(len(part) - n + 1)])
-        return tokens
+# ---------------------------------------------------------------------------
+# ユーティリティ
+# ---------------------------------------------------------------------------
+def tokenize_ngrams(text: str, n: int = 2) -> list[str]:
+    """文字n-gram分割。連続文字の圧縮と数字列の保護を行う。"""
+    if not text:
+        return []
 
-    def fit(self, corpus):
-        """記憶データ全体からBM25インデックスを再構築する。"""
-        # 同じインスタンスでfitを再実行しても古い統計が残らないよう初期化
-        self.doc_len = []
-        self.doc_freqs = []
-        self.idf = {}
-        self.docs_tokens = []
-        self.avgdl = 0.0
-        self.corpus_size = len(corpus)
+    # 同じ文字の3回以上の連続は2文字に圧縮
+    text = _REPEAT_RE.sub(r"\1\1", text)
+    tokens: list[str] = []
+    for part in _DIGIT_SPLIT_RE.split(text):
+        if not part:
+            continue
+        if part.isdigit() or len(part) < n:
+            tokens.append(part)
+        else:
+            tokens.extend(part[i : i + n] for i in range(len(part) - n + 1))
+    return tokens
 
-        if self.corpus_size == 0:
-            return
 
-        self.docs_tokens = [self.tokenize(doc) for doc in corpus]
-        self.doc_len = [len(tokens) for tokens in self.docs_tokens]
-        self.avgdl = sum(self.doc_len) / self.corpus_size
+def _sparse_dot(a: dict[str, float], b: dict[str, float]) -> float:
+    """疎ベクトルの内積 (小さい方を走査する)。"""
+    if len(a) > len(b):
+        a, b = b, a
+    return sum(v * b[k] for k, v in a.items() if k in b)
 
-        df = Counter()
-        for tokens in self.docs_tokens:
-            frequencies = Counter(tokens)
-            self.doc_freqs.append(frequencies)
-            df.update(frequencies.keys())
 
-        self.idf = {
-            token: math.log((self.corpus_size - freq + 0.5) / (freq + 0.5) + 1.0)
-            for token, freq in df.items()
-        }
+def _normalize_vector(vector: dict[str, float]) -> dict[str, float]:
+    norm = math.sqrt(sum(v * v for v in vector.values()))
+    return {k: v / norm for k, v in vector.items()} if norm else {}
 
-    def get_score(self, query_tokens, index):
-        """指定したインデックスの記憶とのBM25スコアを算出"""
-        score = 0.0
-        doc_tokens = self.doc_freqs[index]
-        d_len = self.doc_len[index]
 
-        if self.avgdl == 0:
-            return 0.0
+def _normalize_scores(values: list[float]) -> list[float]:
+    """min-max正規化。全て同値なら全部0。"""
+    if not values:
+        return []
+    low, high = min(values), max(values)
+    if high - low <= 1e-12:
+        return [0.0] * len(values)
+    span = high - low
+    return [(v - low) / span for v in values]
 
-        for token in query_tokens:
-            if token not in doc_tokens:
-                continue
-            idf = self.idf.get(token, 0.0)
-            tf = doc_tokens[token]
-            # BM25 Core Formula
-            num = tf * (self.k1 + 1)
-            den = tf + self.k1 * (1 - self.b + self.b * (d_len / self.avgdl))
-            score += idf * (num / den)
 
-        return score
+def _entry_text(entry) -> str:
+    return str(entry[0]) if entry and entry[0] is not None else ""
 
+
+def _is_system_or_marker(entry) -> bool:
+    text, speaker = entry[0], str(entry[1])
+    return "!system" in speaker or text in SYSTEM_MARKERS or speaker == "!"
+
+
+def _is_user_entry(entry) -> bool:
+    """人間ユーザーの発言か (bot・システム・直接学習分を除く)。"""
+    if _is_system_or_marker(entry):
+        return False
+    speaker = str(entry[1])
+    return speaker not in BOT_SPEAKERS and not speaker.startswith("!input-")
+
+
+# ---------------------------------------------------------------------------
+# トークナイザー
+# ---------------------------------------------------------------------------
 class NgramTokenizer:
     """文字の結合度を学習し、単語置換処理で使うトークナイザー。"""
+
     def __init__(self):
-        self.char_counts = Counter()
-        self.bigram_counts = Counter()
-        self.forced_words = set()
-        
-    def train(self, corpus_list):
+        self.char_counts: Counter = Counter()
+        self.bigram_counts: Counter = Counter()
+        self.forced_words: set[str] = set()
+        self._forced_prefixes: set[str] = set()
+
+    def train(self, corpus: Iterable[str]):
         """1文字と2文字の出現頻度をカウント"""
-        for sentence in corpus_list:
-            if not sentence:
+        for sentence in corpus:
+            if not sentence or not isinstance(sentence, str):
                 continue
             self.char_counts.update(sentence)
-            bigrams = [sentence[i:i+2] for i in range(len(sentence)-1)]
-            self.bigram_counts.update(bigrams)
-
-    def register_words(self, words_list):
-        """分割してほしくない単語を辞書として登録する"""
-        self.forced_words.update(words_list)
-
-    def _get_cohesion_score(self, c1, c2):
-        """2文字の結合度スコア（条件付き確率）"""
-        bigram = c1 + c2
-        if self.char_counts[c1] == 0 or self.bigram_counts[bigram] == 0:
-            return 0.0
-        return self.bigram_counts[bigram] / self.char_counts[c1]
-
-    def tokenize(self, text, drop_threshold=0.3):
-        """結合度スコアがしきい値より低いタイミングで区切る"""
-        if len(text) <= 1:
-            return [text]
-            
-        words = []
-        current_word = text[0]
-        
-        for i in range(len(text) - 1):
-            c1, c2 = text[i], text[i+1]
-            candidate = current_word + c2
-            
-            is_part_of_forced_word = any(
-                fw.startswith(candidate) for fw in self.forced_words
+            self.bigram_counts.update(
+                sentence[i : i + 2] for i in range(len(sentence) - 1)
             )
-            
-            if is_part_of_forced_word:
-                current_word = candidate
-            else:
-                score = self._get_cohesion_score(c1, c2)
-                if score < drop_threshold:
-                    words.append(current_word)
-                    current_word = c2
-                else:
-                    current_word += c2
-                
-        if current_word:
-            words.append(current_word)
-            
-        return words
+
+    def register_words(self, words: Iterable[str]):
+        """分割してほしくない単語を登録する"""
+        for word in words:
+            if not word:
+                continue
+            self.forced_words.add(word)
+            self._forced_prefixes.update(word[:i] for i in range(1, len(word) + 1))
+
+    def _cohesion(self, c1: str, c2: str) -> float:
+        """2文字の結合度 (条件付き確率 P(c2|c1))"""
+        char_count = self.char_counts.get(c1, 0)
+        bigram_count = self.bigram_counts.get(c1 + c2, 0)
+        return bigram_count / char_count if char_count and bigram_count else 0.0
     
-    def save(self, file_path):
-        """学習済みの統計データをファイルに保存する"""
-        self_to_save = {
-            'char_counts': self.char_counts,
-            'bigram_counts': self.bigram_counts
+    def _pmi(self, c1: str, c2: str) -> float:
+        """2文字の相互情報量 (PMI) を計算。文字種に依存せず、統計的な結合度を測る。"""
+        bigram_count = self.bigram_counts.get(c1 + c2, 0)
+        if bigram_count == 0:
+            return 0.0
+            
+        total_chars = sum(self.char_counts.values())
+        p_x = self.char_counts.get(c1, 0) / total_chars
+        p_y = self.char_counts.get(c2, 0) / total_chars
+        p_xy = bigram_count / sum(self.bigram_counts.values())
+        
+        # PMI = log2( P(x,y) / (P(x)*P(y)) )
+        return math.log2(p_xy / (p_x * p_y + 1e-10))
+
+    def tokenize(self, text: str, drop_threshold: float = 1.0) -> list[str]:
+        """アプリオリな文字種分断を一切行わず、PMI（統計的結びつき）のみで単語をtokenizeする"""
+        if not text:
+            return []
+        if len(text) == 1:
+            return [text]
+
+        words: list[str] = []
+        current = text[0]
+        
+        # 記憶全体のPMIの平均的な閾値を自動調整（あるいは固定のdrop_thresholdを使用）
+        for c1, c2 in zip(text, text[1:]):
+            candidate = current + c2
+            
+            # 強制登録単語のプレフィックスであるか、または統計的な結合度(PMI)が閾値以上か
+            # ※記号やスペース、数字の並びであっても、ログに一塊で存在するならPMIは高くなる
+            if candidate in self._forced_prefixes or self._pmi(c1, c2) >= drop_threshold:
+                current = candidate
+            else:
+                # 統計的に結合が切れる（独立性が高い）場所でのみ区切る
+                words.append(current)
+                current = c2
+                
+        words.append(current)
+        return words
+
+
+    def save(self, file_path: Path | str):
+        data = {
+            "char_counts": dict(self.char_counts),
+            "bigram_counts": dict(self.bigram_counts),
+            "forced_words": sorted(self.forced_words),
         }
-        with open(file_path, 'wb') as f:
-            pickle.dump(self_to_save, f)
+        with open(file_path, "w", encoding="utf8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4, sort_keys=True, separators=(',', ': '))
 
-    def load(self, file_path):
-        """保存されたファイルから統計データを復元する"""
-        with open(file_path, 'rb') as f:
-            loaded_self = pickle.load(f)
-        self.char_counts = loaded_self['char_counts']
-        self.bigram_counts = loaded_self['bigram_counts']
-        print(f"🚀 モデルを正常に読み込みました: {file_path}")
+    def load(self, file_path: Path | str):
+        with open(file_path, "r", encoding="utf8") as f:
+            data = json.load(f)
+        self.char_counts = Counter(data.get("char_counts", {}))
+        self.bigram_counts = Counter(data.get("bigram_counts", {}))
+        self.forced_words.clear()
+        self._forced_prefixes.clear()
+        self.register_words(data.get("forced_words", []))
+        logger.info("トークナイザーモデルを読み込みました: %s", file_path)
 
-class Himawaria:
-    """会話記憶の検索・学習・応答を管理するクラス。
+    def load_legacy_pickle(self, file_path: Path | str):
+        """旧形式(pickle)の読み込み。自分で作った信頼できるファイルにのみ使うこと。"""
+        with open(file_path, "rb") as f:
+            data = pickle.load(f)
+        self.char_counts = Counter(data.get("char_counts", {}))
+        self.bigram_counts = Counter(data.get("bigram_counts", {}))
+        logger.info("旧形式のトークナイザーモデルを読み込みました: %s", file_path)
 
-    memory.json の sentence は [発言, 話者] のペアを順に保持する。
-    looking() は候補検索と順位付けを行い、receive() は入力から応答までを管理する。
+
+# ---------------------------------------------------------------------------
+# 自前の意味ベクトル
+# ---------------------------------------------------------------------------
+class SelfSemanticLearner:
+    """記憶内の共起関係からPPMI意味ベクトルを自給自足するクラス"""
+
+    def __init__(self, window_size: int = 2):
+        self.window_size = window_size
+        self.vocab: set[str] = set()
+        self.co_occurrence: dict[str, Counter] = {}
+        self.word_vectors: dict[str, dict[str, float]] = {}
+        self._norms: dict[str, float] = {}
+
+    def train_from_memory(self, sentence_pairs: Sequence, tokenizer: NgramTokenizer):
+        """memory["sentence"] の [発言, 話者] ペアから共起関係を学習する"""
+        self.co_occurrence.clear()
+        self.vocab.clear()
+        self.word_vectors.clear()
+        self._norms.clear()
+
+        tokenized: list[list[str]] = []
+        word_counts: Counter = Counter()
+
+        for entry in sentence_pairs:
+            if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                continue
+            text, speaker = entry[0], entry[1]
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if text in SYSTEM_MARKERS or "!system" in str(speaker):
+                continue
+            tokens = tokenizer.tokenize(text, drop_threshold=SEMANTIC_DROP_THRESHOLD)
+            if not tokens:
+                continue
+            tokenized.append(tokens)
+            word_counts.update(tokens)
+            self.vocab.update(tokens)
+
+        window = self.window_size
+        for tokens in tokenized:
+            for i, target in enumerate(tokens):
+                contexts = self.co_occurrence.setdefault(target, Counter())
+                for j in range(max(0, i - window), min(len(tokens), i + window + 1)):
+                    if i != j:
+                        contexts[tokens[j]] += 1
+
+        total_cooc = sum(sum(ctx.values()) for ctx in self.co_occurrence.values())
+        if total_cooc == 0:
+            return
+
+        for word, contexts in self.co_occurrence.items():
+            p_x = word_counts[word] / total_cooc
+            vector: dict[str, float] = {}
+            for ctx_word, count in contexts.items():
+                p_y = word_counts[ctx_word] / total_cooc
+                pmi = math.log2((count / total_cooc) / (p_x * p_y + 1e-10))
+                if pmi > 0:  # PPMI: 0以下は保持しない
+                    vector[ctx_word] = pmi
+            self.word_vectors[word] = vector
+
+        self._norms = {
+            word: math.sqrt(sum(v * v for v in vec.values()))
+            for word, vec in self.word_vectors.items()
+        }
+        logger.info("自前意味ベクトルを構築しました。総語彙数: %d", len(self.vocab))
+
+    def calculate_similarity(self, word1: str, word2: str) -> float:
+        """意味ベクトル同士のコサイン類似度"""
+        v1 = self.word_vectors.get(word1)
+        v2 = self.word_vectors.get(word2)
+        if not v1 or not v2:
+            return 0.0
+        denom = self._norms[word1] * self._norms[word2]
+        return _sparse_dot(v1, v2) / denom if denom else 0.0
+
+    def arithmetic(
+        self,
+        positive: list[str] | None = None,
+        negative: list[str] | None = None,
+        top_n: int = 5,
+    ) -> list[tuple[str, float]]:
+        """単語の演算 (例: 王様 - 男 + 女)"""
+        positive = positive or []
+        negative = negative or []
+        all_inputs = set(positive) | set(negative)
+
+        for word in all_inputs:
+            if word not in self.word_vectors:
+                logger.warning("単語 '%s' はまだ記憶(学習データ)に存在しません。", word)
+                return []
+
+        target: Counter = Counter()
+        for word in positive:
+            for ctx_word, val in self.word_vectors[word].items():
+                target[ctx_word] += val
+        for word in negative:
+            for ctx_word, val in self.word_vectors[word].items():
+                target[ctx_word] -= val
+                if target[ctx_word] <= 0:
+                    del target[ctx_word]
+
+        norm_target = math.sqrt(sum(v * v for v in target.values()))
+        if not target or norm_target == 0:
+            return []
+
+        results: list[tuple[str, float]] = []
+        for word, vector in self.word_vectors.items():
+            if word in all_inputs:
+                continue
+            dot = _sparse_dot(target, vector)
+            norm_word = self._norms.get(word, 0.0)
+            if dot == 0 or norm_word == 0:
+                continue
+            results.append((word, dot / (norm_target * norm_word)))
+
+        return heapq.nlargest(top_n, results, key=lambda item: item[1])
+
+
+# ---------------------------------------------------------------------------
+# TF-IDF索引
+# ---------------------------------------------------------------------------
+class TfidfIndex:
+    """転置索引つきTF-IDF索引。
+
+    末尾への追加は増分で反映し、IDFのズレを抑えるため一定件数ごとに全再構築する。
+    先頭削除や途中挿入が起きたときは invalidate() で全再構築を予約する。
     """
-    def __init__(self, directory, maximum_word_replacer_memory=128, min_similarity_threshold=0.45):
-        self.direc = directory
+
+    def __init__(self, rebuild_interval: int = 500):
+        self.rebuild_interval = rebuild_interval
+        self.doc_count = 0
+        self.df: Counter = Counter()
+        self.postings: dict[str, list[int]] = {}
+        self.vectors: list[dict[str, float]] = []
+        self._since_rebuild = 0
+        self._stale = True
+
+    def invalidate(self):
+        self._stale = True
+
+    def _idf(self, doc_freq: int) -> float:
+        return math.log((self.doc_count + 1) / (doc_freq + 1)) + 1.0
+
+    def _vectorize(self, tokens: list[str], idf_cache: dict[str, float] | None = None) -> dict[str, float]:
+        vector: dict[str, float] = {}
+        for token, count in Counter(tokens).items():
+            doc_freq = self.df.get(token)
+            if not doc_freq:
+                continue  # 索引に存在しないトークンは無視
+            idf = idf_cache[token] if idf_cache is not None else self._idf(doc_freq)
+            vector[token] = count * idf
+        return _normalize_vector(vector)
+
+    def rebuild(self, entries: Sequence):
+        df: Counter = Counter()
+        postings: dict[str, list[int]] = {}
+        doc_tokens: list[list[str]] = []
+
+        for idx, entry in enumerate(entries):
+            tokens = tokenize_ngrams(_entry_text(entry))
+            doc_tokens.append(tokens)
+            unique = set(tokens)
+            df.update(unique)
+            for token in unique:
+                postings.setdefault(token, []).append(idx)
+
+        self.doc_count = len(doc_tokens)
+        self.df = df
+        self.postings = postings
+        idf_cache = {token: self._idf(freq) for token, freq in df.items()}
+        self.vectors = [self._vectorize(tokens, idf_cache) for tokens in doc_tokens]
+        self._since_rebuild = 0
+        self._stale = False
+
+    def _append(self, entries: Sequence):
+        for entry in entries:
+            tokens = tokenize_ngrams(_entry_text(entry))
+            idx = self.doc_count
+            self.doc_count += 1
+            unique = set(tokens)
+            self.df.update(unique)
+            for token in unique:
+                self.postings.setdefault(token, []).append(idx)
+            self.vectors.append(self._vectorize(tokens))
+        self._since_rebuild += len(entries)
+
+    def sync(self, entries: Sequence):
+        """記憶の現状に索引を合わせる。変化がなければ何もしない。"""
+        size = len(entries)
+        if not self._stale and size == self.doc_count:
+            return
+        added = size - self.doc_count
+        if not self._stale and 0 < added and self._since_rebuild + added <= self.rebuild_interval:
+            self._append(entries[self.doc_count :])
+        else:
+            self.rebuild(entries)
+
+    def query_vector(self, tokens: list[str]) -> dict[str, float]:
+        return self._vectorize(tokens)
+
+    def cosine(self, query_vector: dict[str, float], idx: int) -> float:
+        if not query_vector or not 0 <= idx < len(self.vectors):
+            return 0.0
+        return _sparse_dot(query_vector, self.vectors[idx])
+
+    def match_counts(self, query_tokens: Iterable[str]) -> Counter:
+        """各文書がクエリのトークンを何種類含むか {idx: 一致数}"""
+        counts: Counter = Counter()
+        for token in set(query_tokens):
+            counts.update(self.postings.get(token, ()))
+        return counts
+
+
+@dataclass(slots=True)
+class _Candidate:
+    idx: int
+    text: float
+    good: bool
+    context: float = 0.0
+    history: float = 0.0
+    style: float = 0.0
+    final: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# 単語置き換えエンジン
+# ---------------------------------------------------------------------------
+class ContextualWordReplacer:
+    """文脈を考慮したトークンベースの単語置換エンジン"""
+
+    def __init__(self, semantic_learner, char_sim=0.85, sem_sim=0.75):
+        self.semantic_learner = semantic_learner
+        self.char_sim = char_sim
+        self.sem_sim = sem_sim
+
+    def extract_token_replacements(self, before_tokens: list[str], after_tokens: list[str]) -> list[dict]:
+        """文字ではなく『トークン単位』で正確な置換ペアと、その左右の広い文脈（計12トークン）を抽出する"""
+        replacements = []
+        matcher = difflib.SequenceMatcher(None, before_tokens, after_tokens)
+        
+        # 24トークンの文脈を見るため、左右に12トークンずつ確保
+        WINDOW_SIZE = 12
+        
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == 'replace':
+                old_tokens = before_tokens[i1:i2]
+                new_tokens = after_tokens[j1:j2]
+                
+                # 左右6トークンずつの環境（文脈）を保存（インデックスの範囲外はBOS/EOSでパディング）
+                left_context = before_tokens[max(0, i1 - WINDOW_SIZE):i1]
+                if i1 - WINDOW_SIZE < 0:
+                    left_context = ["<BOS>"] * (WINDOW_SIZE - i1) + left_context
+                    
+                right_context = before_tokens[i2:min(len(before_tokens), i2 + WINDOW_SIZE)]
+                if i2 + WINDOW_SIZE > len(before_tokens):
+                    right_context = right_context + ["<EOS>"] * (i2 + WINDOW_SIZE - len(before_tokens))
+                
+                replacements.append({
+                    "old": old_tokens,
+                    "new": new_tokens,
+                    "left": left_context,   # 12トークンのリスト
+                    "right": right_context  # 12トークンのリスト
+                })
+        return replacements
+
+    def _match_context_and_semantics(self, tokens: list[str], idx: int, rep: dict) -> bool:
+        """単語の類似度だけでなく、『前後12トークンの広域文脈』が一致するかを検証する"""
+        old_tokens = rep["old"]
+        if idx + len(old_tokens) > len(tokens):
+            return False
+            
+        WINDOW_SIZE = 12
+            
+        # 1. 対象の単語自体が一致、または類似しているかチェック
+        is_exact_match = (tokens[idx : idx + len(old_tokens)] == old_tokens)
+        if not is_exact_match:
+            for offset, old_w in enumerate(old_tokens):
+                target_w = tokens[idx + offset]
+                if Levenshtein.normalized_similarity(target_w, old_w) >= self.char_sim:
+                    continue
+                if self.semantic_learner.calculate_similarity(target_w, old_w) >= self.sem_sim:
+                    continue
+                return False
+
+        # 2. 【24トークン広域文脈判定】
+        # 実際の現在のトークン列から前後12トークンを切り出し（パディング付き）
+        actual_left = tokens[max(0, idx - WINDOW_SIZE):idx]
+        if idx - WINDOW_SIZE < 0:
+            actual_left = ["<BOS>"] * (WINDOW_SIZE - idx) + actual_left
+            
+        right_start = idx + len(old_tokens)
+        actual_right = tokens[right_start : min(len(tokens), right_start + WINDOW_SIZE)]
+        if right_start + WINDOW_SIZE > len(tokens):
+            actual_right = actual_right + ["<EOS>"] * (right_start + WINDOW_SIZE - len(tokens))
+            
+        # 左右それぞれ12トークンが「完全一致」している数をカウント
+        left_matches = sum(1 for a, b in zip(actual_left, rep["left"]) if a == b)
+        right_matches = sum(1 for a, b in zip(actual_right, rep["right"]) if a == b)
+        
+        # 通常の単語（文字列）の場合：
+        # 24トークン中、左右合わせて最低でも6トークン以上の文脈一致を求める（環境の安全性を担保）
+        if (left_matches + right_matches) < 6 and not is_exact_match:
+            return False
+                
+        return True
+
+    def execute_replace(self, text: str, after_list: list[str], before_list: list[str], tokenizer_func) -> str:
+        """文脈付き置換を実行する"""
+        # すべての置換履歴からトークンベースのルールを構築
+        all_rules = []
+        for after, before in zip(after_list, before_list):
+            if not after or not before:
+                continue
+            b_tokens = tokenizer_func(before, drop_threshold=0.4)
+            a_tokens = tokenizer_func(after, drop_threshold=0.4)
+            all_rules.extend(self.extract_token_replacements(b_tokens, a_tokens))
+            
+        # 最新の履歴を優先
+        all_rules.reverse()
+        
+        # 入力文をトークナイズ
+        tokens = tokenizer_func(text, drop_threshold=0.4)
+        i = 0
+        while i < len(tokens):
+            replaced = False
+            for rule in all_rules:
+                if self._match_context_and_semantics(tokens, i, rule):
+                    logger.info(f"文脈置換適用: {tokens[i:i+len(rule['old'])]} -> {rule['new']} (文脈: {rule['left']}_{rule['right']})")
+                    # トークンリストを書き換え
+                    tokens[i:i+len(rule['old'])] = rule['new']
+                    i += len(rule['new'])
+                    replaced = True
+                    break
+            if not replaced:
+                i += 1
+                
+        return "".join(tokens)
+
+# ---------------------------------------------------------------------------
+# 本体
+# ---------------------------------------------------------------------------
+class Himawaria:
+    """会話記憶の検索・学習・応答を管理するクラス。"""
+
+    def __init__(
+        self,
+        directory: str,
+        maximum_word_replacer_memory: int = 128,
+        min_similarity_threshold: float = 0.45,  # 互換性のため保持 (現在は未使用)
+        *,
+        config: SearchConfig | None = None,
+        max_sentences: int = MAX_SENTENCES,
+        autosave_every: int = 1,
+        semantic_rebuild_interval: int = 50,
+        rng: random.Random | None = None,
+    ):
+        self.direc = Path(directory)
+        self.direc.mkdir(parents=True, exist_ok=True)
+
         self.maximum_word_replacer_memory = maximum_word_replacer_memory
         self.min_similarity_threshold = min_similarity_threshold
+        self.config = config or SearchConfig()
+        self.max_sentences = max_sentences
+        self.autosave_every = max(1, autosave_every)
+        self.semantic_rebuild_interval = semantic_rebuild_interval
+        self._rng = rng or random.Random()
 
-        self.memory = None
-        self.settings = None
-        self.heart = None
+        self.memory: dict = {}
+        self.settings: dict = {}
+        self.chara_style = ""
+
         self.last_bot_response = ""
         self.last_bot_base = ""
         self.last_input_content = ""
@@ -207,618 +650,635 @@ class Himawaria:
         self.last_input_user = ""
         self.last_input_similar_user = ""
         self.pre_heart = 0
+        self.heart = 0
         self.last_user = "あんた"
-        self.last_user_bot_replied = "あんた"
-        self.current_voice = None
-        self.user_log = [None] * 10
-        self.word_replacer_memory_after = []
-        self.word_replacer_memory_before = []
+        self.last_user_replied = "あんた"
+        self.current_voice: str | None = None
+        self.user_log: list = [None] * 10
+        self.word_replacer_memory_after: list[str] = []
+        self.word_replacer_memory_before: list[str] = []
         self.last_previous_input_user = ""
+        self.last_previous_input_content = ""
         self.rate = 1.0
-        self.latest_log = [["init", "init"]]
+        self.latest_log: list = [["init", "init"]]
 
-        try:
-            with open(self.direc+"/memory.json", "r", encoding="utf8") as f:
-                self.memory = json.load(f)
-            with open(self.direc+"/settings.json", "r", encoding="utf8") as f:
+        self.tokenizer = NgramTokenizer()
+        self.semantic_learner = SelfSemanticLearner(window_size=2)
+        self.index = TfidfIndex()
+        self.contextual_word_replacer = ContextualWordReplacer(semantic_learner=self.semantic_learner)
+        self._semantic_trained_size: int | None = None
+        self._unsaved = 0
+        self._main_is_valid = False
+
+        self._load_initial_data()
+        self._init_tokenizer()
+
+        sentences = self.memory["sentence"]
+        if sentences:
+            self.heart = self._rng.randint(0, len(sentences) - 1)
+
+    # ------------------------------------------------------------------
+    # 読み込み・保存
+    # ------------------------------------------------------------------
+    @property
+    def my_names(self) -> list[str]:
+        return [n for n in self.settings.get("mynames", "").split("|") if n]
+
+    def _load_initial_data(self):
+        """設定・記憶・キャラクター口調ファイルの読み込み"""
+        memory_path = self.direc / "memory.json"
+        backup_path = self.direc / "memory_backup.json"
+        settings_path = self.direc / "settings.json"
+        chara_path = self.direc / "chara_style.txt"
+
+        if settings_path.exists():
+            with open(settings_path, "r", encoding="utf8") as f:
                 self.settings = json.load(f)
-        except:
-            with open(self.direc+"/memory_backup.json", "r", encoding="utf8") as f:
-                self.memory = json.load(f)
-            with open(self.direc+"/settings.json", "r", encoding="utf8") as f:
-                self.settings = json.load(f)
-            with open(self.direc+"/memory.json", "w", encoding="utf8") as f:
-                json.dump(self.memory, f, ensure_ascii=False, indent=4, sort_keys=True, separators=(',', ': '))
-        self.heart = len(self.memory["sentence"]) - 1
+        else:
+            self.settings = {"mynames": "ひまわり|ヒマワリ"}
 
-        try:
-            with open(self.direc+"/chara_style.txt", "r", encoding="utf8") as f:
-                self.chara_style = f.read()
-        except:
-            with open(self.direc+"/chara_style.txt", "w", encoding="utf8") as f:
-                f.write("")
-                self.chara_style = ""
+        self.memory = {}
+        for path in (memory_path, backup_path):
+            if not path.exists():
+                continue
+            try:
+                with open(path, "r", encoding="utf8") as f:
+                    data = json.load(f)
+            except (OSError, ValueError) as e:
+                logger.warning("記憶ファイルの読み込みに失敗: %s (%s)", path, e)
+                continue
+            if isinstance(data, dict) and "sentence" in data:
+                self.memory = data
+                self._main_is_valid = path == memory_path
+                break
+            logger.warning("記憶ファイルの形式が不正です: %s", path)
 
-        with open(self.direc+"/memory_backup.json", "w", encoding="utf8") as f:
-            json.dump(self.memory, f, ensure_ascii=False, indent=4, sort_keys=True, separators=(',', ': '))
-
+        self.memory.setdefault("sentence", [])
         self.memory.setdefault("word_replacer_memory_after", [])
         self.memory.setdefault("word_replacer_memory_before", [])
-        
         self.word_replacer_memory_after = self.memory["word_replacer_memory_after"]
         self.word_replacer_memory_before = self.memory["word_replacer_memory_before"]
 
-        self.tokenizer = NgramTokenizer()
-        try:
-            self.tokenizer.load(self.direc+"/tokenizer.model")
-        except:
-            for sen in self.memory["sentence"]:
-                self.tokenizer.train([sen[0]])
-                self.tokenizer.train([sen[1]])
-        self.heart = random.randint(0, max(0, len(self.memory["sentence"]) - 1))
-        
-    # ------------------------------------------------------------------
-    # 学習・保存
-    # ------------------------------------------------------------------
-    def learnSentence(self, x, u, save=True, directLearning=False):
-        if u not in self.settings["mynames"].split("|") and directLearning and u not in ["!input", "!output", "!system"]:
-            u = "!input-"+u
-
-        if u in self.settings["mynames"].split("|"):
-            self.memory["sentence"].append([x, "!output"])
+        if chara_path.exists():
+            self.chara_style = chara_path.read_text(encoding="utf8")
         else:
-            self.memory["sentence"].append([x, u])
-        self.tokenizer.train([x, u])
+            self.chara_style = ""
+            chara_path.write_text("", encoding="utf8")
 
-        if len(self.memory["sentence"]) >= 1600000:
-            while len(self.memory["sentence"]) >= 1600000:
-                del self.memory["sentence"][0]
-                if self.heart >= 5 or self.pre_heart >= 5:
-                    self.heart -= 1
-                    self.pre_heart -= 1
-        if save:
-            self.saveData()
-
-    def saveData(self):
-        with open(self.direc+"/memory.json", "w", encoding="utf8") as f:
-            json.dump(self.memory, f, ensure_ascii=False, indent=4, sort_keys=True, separators=(',', ': '))
-        self.tokenizer.save(self.direc+"/tokenizer.model")
-
-    def evalute(self):
-        flag1 = False
-        flag2 = False
-        if self.memory["sentence"][-1][0] not in ["!bad", "!good"]:
-            if self.heart + 1 < len(self.memory["sentence"]) - 1:
-                if self.memory["sentence"][self.heart+1][0] == "!good":
-                    flag1 = True
-            if flag1:
-                print("このメッセージは良い")
-                self.learnSentence("!good", "!system")
-
-        if self.memory["sentence"][-1][0] not in ["!bad", "!good"] and not flag1:
-            if self.heart + 1 < len(self.memory["sentence"]) - 1:
-                if self.memory["sentence"][self.heart+1][0] == "!bad":
-                    flag2 = True
-            if flag2:
-                print("このメッセージは悪い")
-                self.learnSentence("!bad", "!system")
-
-    def isNextOk(self):
-        if len(self.memory["sentence"]) - 1 <= self.heart + 1:
-            return False
-        next_sen = self.memory["sentence"][self.heart + 1]
-        curr_sen = self.memory["sentence"][self.heart]
-        return (self.last_input_content != next_sen[0] and
-                self.last_bot_response != next_sen[0] and
-                next_sen[1] == curr_sen[1] and
-                next_sen[1] != "!" and
-                "!system" not in next_sen[1])
-
-    # ------------------------------------------------------------------
-    # 応答後の単語置換
-    # ------------------------------------------------------------------
-    def replaceWords(self, x, inputs, inputsHeart):
-        """
-        単語置換処理: 助詞や短いトークンの破壊的・誤認置換を抑制し、安全な置換を実施
-        """
-        replacements = []
-        used = []
-        w3 = self.tokenizer.tokenize(x, drop_threshold=0.4)
-        
-        for i in range(len(inputs)):
-            if not inputs[i] or not inputsHeart[i]:
+    def _init_tokenizer(self):
+        """保存済みモデルがあれば読み込み、なければ記憶から学習する"""
+        candidates = (
+            (self.direc / TOKENIZER_FILE, self.tokenizer.load),
+            (self.direc / LEGACY_TOKENIZER_FILE, self.tokenizer.load_legacy_pickle),
+        )
+        for path, loader in candidates:
+            if not path.exists():
                 continue
-            w1 = self.tokenizer.tokenize(inputs[i], drop_threshold=0.4)
-            w2 = self.tokenizer.tokenize(inputsHeart[i], drop_threshold=0.4)
+            try:
+                loader(path)
+                return
+            except Exception as e:  # 壊れたモデルは捨てて学習し直す
+                logger.warning("トークナイザーモデルの読み込みに失敗しました: %s (%s)", path, e)
+        self._train_tokenizer_from_memory()
 
-            diffs = list(difflib.ndiff(w2, w1))
-            old, new = "", ""
-            for diff in diffs:
-                tag, content = diff[:2], diff[2:]
-                if tag == "- ":
-                    old += content
-                elif tag == "+ ":
-                    new += content
-                elif tag == "  ":
-                    if old or new:
-                        if old and new and len(old) >= 2:
-                            replacements.append((old, new))
-                        old, new = "", ""
-            if (old or new) and len(old) >= 2:
-                replacements.append((old, new))
-                
-        res_tokens = list(w3)
-        for idx, token in enumerate(res_tokens):
-            if len(token) <= 1:
-                continue
-            for old, new in reversed(replacements):
-                sim = Levenshtein.normalized_similarity(token, old)
-                if sim >= 0.85:
-                    print(f"単語置換: {token} ({old}) => {new}")
-                    res_tokens[idx] = new
-                    break
-
-        return "".join(res_tokens)
-
-    def isAvailable(self, d, b, type=1):
-        if type == 0:
-            flag = False
-            for i in range(1):
-                if b + 2 + i < len(self.memory["sentence"]) - 1:
-                    if self.memory["sentence"][b+2+i][0] == "!good":
-                        flag = True
-                        break
-            for i in range(1):
-                if b + 2 + i < len(self.memory["sentence"]) - 1:
-                    if self.memory["sentence"][b+2+i][0] == "!bad":
-                        flag = False
-                        break
-            return flag and d >= 0.6
-        elif type == 1:
-            flag = True
-            for i in range(1):
-                if b + 2 + i < len(self.memory["sentence"]) - 1:
-                    if self.memory["sentence"][b+2+i][0] == "!bad":
-                        flag = False
-                        break
-            return flag
-
-    # ------------------------------------------------------------------
-    # 検索候補の生成・採点
-    # ------------------------------------------------------------------
-    def update_bm25_index(self):
-        """各発言をシンプルにインデックス化する"""
-        sentences = self.memory["sentence"]
-        corpus = []
-
-        for i in range(len(sentences)):
-            curr_text, speaker = sentences[i][0], sentences[i][1]
-            curr_tag = "[!]" if speaker == "!" else f"[{speaker}]"
-            # 余計な過去ログの連結をやめ、その発言単体をドキュメントにする
-            corpus.append(f"{curr_tag}{curr_text}")
-
-        self.bm25 = BM25Searcher(k1=BM25_K1, b=BM25_B)
-        self.bm25.fit(corpus)
-
-    def _is_duplicate(self, reply, last_input, last_bot_resp, last_bot_base):
-        """短文や記号（「？」など）が重複判定で弾かれるのを防ぐヘルパー"""
-        if len(reply) <= 2:
-            return reply == last_bot_resp or reply == last_bot_base
-        
-        if Levenshtein.normalized_similarity(reply, last_input) >= 0.85:
-            return True
-        if Levenshtein.normalized_similarity(reply, last_bot_resp) >= 0.85:
-            return True
-        if Levenshtein.normalized_similarity(reply, last_bot_base) >= 0.85:
-            return True
-            
-        return False
-
-    def _has_good_tag(self, idx):
-        """指定位置の1つ下、または2つ下（返信のすぐ下）に !good があるか判定"""
-        total_len = len(self.memory["sentence"])
-        for offset in (1, 2):
-            if idx + offset < total_len:
-                if self.memory["sentence"][idx + offset][0] == "!good":
-                    return True
-        return False
+    def _train_tokenizer_from_memory(self):
+        self.tokenizer.train(
+            entry[0]
+            for entry in self.memory["sentence"]
+            if len(entry) >= 2 and entry[0] not in SYSTEM_MARKERS
+        )
 
     @staticmethod
-    def _normalize_scores(values):
-        """スコア列を0〜1に正規化する。同点しかない場合は全件0を返す。"""
-        if not values:
+    def _write_json_atomic(path: Path, data: dict, backup_path: Path | None = None):
+        """一時ファイルに書いてから置き換える。旧ファイルはバックアップへ退避する。"""
+        tmp_path = path.with_name(path.name + ".tmp")
+        with open(tmp_path, "w", encoding="utf8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4, sort_keys=True, separators=(',', ': '))
+        if backup_path is not None and path.exists():
+            os.replace(path, backup_path)
+        os.replace(tmp_path, path)
+
+    def save_data(self):
+        """記憶とトークナイザーを保存する"""
+        memory_path = self.direc / "memory.json"
+        backup_path = self.direc / "memory_backup.json"
+        # 本体が壊れている可能性がある間は、正常なバックアップを上書きしない
+        self._write_json_atomic(
+            memory_path, self.memory, backup_path if self._main_is_valid else None
+        )
+        self._main_is_valid = True
+        self.tokenizer.save(self.direc / TOKENIZER_FILE)
+        self._unsaved = 0
+
+    # ------------------------------------------------------------------
+    # 学習
+    # ------------------------------------------------------------------
+    def learn_sentence(self, x: str, u: str, save: bool = True, direct_learning: bool = False):
+        """会話を記憶に追加する"""
+        if u in self.my_names:
+            speaker = "!output"
+        elif direct_learning and u not in RESERVED_SPEAKERS:
+            speaker = "!input-" + u
+        else:
+            speaker = u
+
+        sentences = self.memory["sentence"]
+        sentences.append([x, speaker])
+        if x not in SYSTEM_MARKERS:
+            self.tokenizer.train([x])
+
+        overflow = len(sentences) - self.max_sentences + 1
+        if overflow > 0:
+            del sentences[:overflow]
+            self.heart = max(0, self.heart - overflow)
+            self.pre_heart = max(0, self.pre_heart - overflow)
+            self.index.invalidate()
+
+        self._unsaved += 1
+        if save and self._unsaved >= self.autosave_every:
+            self.save_data()
+
+    def record(self):
+        if self.current_voice:
+            self.learn_sentence(self.current_voice, "!")
+            self.evaluate()
+
+    def evaluate(self):
+        """フィードバック(!good / !bad)の評価"""
+        sentences = self.memory["sentence"]
+        if not sentences or sentences[-1][0] in SYSTEM_MARKERS:
+            return
+        if self.heart + 1 < len(sentences) - 1:
+            flag = sentences[self.heart + 1][0]
+            if flag in SYSTEM_MARKERS:
+                logger.info("このメッセージは%s", "良い" if flag == "!good" else "悪い")
+                self.learn_sentence(flag, "!system")
+
+    # ------------------------------------------------------------------
+    # 索引
+    # ------------------------------------------------------------------
+    def update_tfidf_index(self):
+        """TF-IDF索引と意味ベクトルを強制的に全再構築する"""
+        self.index.rebuild(self.memory["sentence"])
+        self._ensure_semantic(force=True)
+
+    def _ensure_index(self):
+        self.index.sync(self.memory["sentence"])
+        self._ensure_semantic()
+
+    def _ensure_semantic(self, force: bool = False):
+        """意味ベクトルは重いので、記憶が一定量増減したときだけ再学習する"""
+        sentences = self.memory["sentence"]
+        trained = self._semantic_trained_size
+        if not force and trained is not None:
+            threshold = max(self.semantic_rebuild_interval, trained // 20)
+            if abs(len(sentences) - trained) < threshold:
+                return
+        self.semantic_learner.train_from_memory(sentences, self.tokenizer)
+        self._semantic_trained_size = len(sentences)
+
+    # ------------------------------------------------------------------
+    # 返信探索
+    # ------------------------------------------------------------------
+    def is_next_ok(self) -> bool:
+        sentences = self.memory["sentence"]
+        if len(sentences) - 1 <= self.heart + 1:
+            return False
+        next_sen = sentences[self.heart + 1]
+        curr_sen = sentences[self.heart]
+        return (
+            self.last_input_content != next_sen[0]
+            and self.last_bot_response != next_sen[0]
+            and next_sen[1] == curr_sen[1]
+            and next_sen[1] != "!"
+            and "!system" not in next_sen[1]
+        )
+
+    def is_available(self, d: float, b: int, type: int = 1) -> bool:  # noqa: A002 (互換性のため)
+        sentences = self.memory["sentence"]
+        tag = sentences[b + 2][0] if b + 2 < len(sentences) - 1 else None
+        if type == 0:
+            return tag == "!good" and d >= 0.6
+        if type == 1:
+            return tag != "!bad"
+        return False
+
+    def _has_good_tag(self, idx: int) -> bool:
+        sentences = self.memory["sentence"]
+        return any(
+            idx + offset < len(sentences) and sentences[idx + offset][0] == "!good"
+            for offset in (1, 2)
+        )
+
+    @staticmethod
+    def _is_duplicate(reply: str, last_input: str, last_bot_resp: str, last_bot_base: str) -> bool:
+        if len(reply) <= 2:
+            return reply in (last_bot_resp, last_bot_base)
+        return any(
+            Levenshtein.normalized_similarity(reply, target) >= DUPLICATE_SIMILARITY
+            for target in (last_input, last_bot_resp, last_bot_base)
+        )
+
+    def _is_valid_pair(self, idx: int) -> bool:
+        """sentences[idx] -> sentences[idx+1] が返信ペアとして使えるか"""
+        sentences = self.memory["sentence"]
+        if idx < 0 or idx + 1 >= len(sentences):
+            return False
+        source, response = sentences[idx], sentences[idx + 1]
+        response_text = response[0]
+        if _is_system_or_marker(response):
+            return False
+        if response_text is None or not str(response_text).strip():
+            return False
+        if str(response[1]) == str(source[1]):
+            return False
+        return not self._is_duplicate(
+            str(response_text),
+            str(self.last_input_content or ""),
+            str(self.last_bot_response or ""),
+            str(self.last_bot_base or ""),
+        )
+
+    def _collect_candidates(self, query_tokens: list[str]) -> list[tuple[float, int]]:
+        """転置索引で絞り込み、(TF-IDFスコア, idx) の候補を返す"""
+        cfg = self.config
+        query_set = set(query_tokens)
+        query_vector = self.index.query_vector(query_tokens)
+        if not query_vector:
             return []
-        low, high = min(values), max(values)
-        if high - low <= 1e-12:
-            return [0.0] * len(values)
-        return [(value - low) / (high - low) for value in values]
 
-    def looking(self, x, u, reply=True, force=False):
-        """現在の入力に近い過去発言を検索し、その次の発言を返す。"""
-        print(f"思考中: {x}")
-        sentences = self.memory.get("sentence", [])
-        total_len = len(sentences)
-        if total_len < 2 or not isinstance(x, str) or not x.strip():
-            return None
+        min_matches = min(cfg.min_query_matches, len(query_set))
+        check_coverage = len(query_set) >= 4
 
-        # learnSentence() が先に呼ばれる設計なので、通常は件数差で再構築される。
-        # fit() 自体も安全に再実行できるよう上で修正済み。
-        if (not hasattr(self, "bm25") or
-                self.bm25.corpus_size != total_len or
-                len(self.bm25.doc_freqs) != total_len):
-            self.update_bm25_index()
-
-        # BM25のクエリ側で同じn-gramを重複加点しない。
-        # 日本語の短い文字列では重複トークンがスコアを不自然に押し上げるため、
-        # まずユニークなn-gramで検索する。
-        tokens_query = list(dict.fromkeys(BM25Searcher.tokenize(x)))
-        if not tokens_query:
-            return None
-
-        def is_system_or_marker(entry):
-            text, speaker = entry[0], str(entry[1])
-            return (
-                "!system" in speaker or
-                text in ("!bad", "!good") or
-                speaker == "!"
-            )
-
-        def valid_pair(idx):
-            """idxの発言と直後の返信が検索候補として有効か判定。"""
-            if idx < 0 or idx + 1 >= total_len:
-                return False
-            source = sentences[idx]
-            response = sentences[idx + 1]
-            response_text, response_speaker = response[0], str(response[1])
-
-            if is_system_or_marker(response):
-                return False
-            if response_text is None or not str(response_text).strip():
-                return False
-            if response_speaker == str(source[1]):
-                return False
-            if self._is_duplicate(
-                str(response_text),
-                str(self.last_input_content or ""),
-                str(self.last_bot_response or ""),
-                str(self.last_bot_base or "")
-            ):
-                return False
-            return True
-
-        # 現在の入力に関連する過去発言を検索。
-        # BM25は一部のn-gramだけが一致しても高得点になりうるため、
-        # 入力n-gramのどれだけが候補発言に含まれるかも確認する。
-        # force=Trueでも、この関連性フィルターは迂回させない。
-        candidates = []
-        min_query_matches = min(2, len(set(tokens_query)))
-        for idx in range(total_len - 1):
-            if not valid_pair(idx):
+        # 1) 安いチェック(一致数・コサイン)だけで全候補をふるいにかける
+        scored: list[tuple[float, int]] = []
+        for idx, match_count in self.index.match_counts(query_set).items():
+            if match_count < min_matches:
                 continue
-
-            doc_tokens = set(self.bm25.docs_tokens[idx])
-            query_token_set = set(tokens_query)
-            matched_tokens = query_token_set.intersection(doc_tokens)
-            match_count = len(matched_tokens)
-            coverage = match_count / max(1, len(query_token_set))
-
-            # 長い入力が「ちゃ」など1個の偶然の一致で通過するのを防ぐ。
-            # 2文字以下の入力は1トークンしかないため、完全一致相当の条件で判定。
-            if match_count < min_query_matches:
+            if check_coverage and match_count / len(query_set) < cfg.min_coverage:
                 continue
-            if len(query_token_set) >= 4 and coverage < 0.20:
+            score = self.index.cosine(query_vector, idx)
+            if score <= cfg.min_tfidf_candidate_score:
                 continue
-
-            score = self.bm25.get_score(tokens_query, idx)
             if self._has_good_tag(idx):
-                score *= GOOD_TAG_MULTIPLIER
-            if score > MIN_BM25_CANDIDATE_SCORE:
+                score *= cfg.good_tag_multiplier
+            scored.append((score, idx))
+
+        # 2) 高スコア順に、重い妥当性チェック(編集距離)を通った上位だけを残す
+        scored.sort(reverse=True)
+        limit = cfg.max_scored_candidates
+        candidates: list[tuple[float, int]] = []
+        for score, idx in scored:
+            if self._is_valid_pair(idx):
                 candidates.append((score, idx))
+                if 0 < limit <= len(candidates):
+                    break
+        return candidates
 
-        # 関連する候補が見つからない場合、force=Trueでも無関係な記憶を
-        # 全件候補に戻さない。ゼロスコアの候補を文脈・goodタグだけで選ぶと、
-        # 「？」のような入力に対して無関係な返信を生成してしまう。
-        if not candidates:
-            print(f"検索候補なし: 入力とのBM25関連度が閾値以下です (force={force})")
-            return None
+    def _recent_user_utterances(self, x: str, u: str) -> list[str]:
+        """直近のユーザー発言 (新しい順、今回の入力は除く)"""
+        log = self.latest_log
+        prior = log[:-1] if log and log[-1] == [x, u] else log
+        limit = len(self.config.history_decay_weights)
 
-        # ライブ履歴から「現在の入力より前」のユーザー発言のみを取得。
-        # latest_logには通常 [発言, 話者] が格納される。
-        live_history = []
-        live_log = getattr(self, "latest_log", [])
-        prior_log = live_log[:-1] if live_log and live_log[-1] == [x, u] else live_log
-        bot_names = {"!", "!output", "bot", "init"}
-        for item in reversed(prior_log):
+        history: list[str] = []
+        for item in reversed(prior):
             if not isinstance(item, (list, tuple)) or len(item) < 2:
                 continue
-            h_text, h_speaker = item[0], str(item[1])
-            if not isinstance(h_text, str) or not h_text.strip():
+            text = item[0]
+            if not isinstance(text, str) or not text.strip() or not _is_user_entry(item):
                 continue
-            if h_speaker in bot_names or "!system" in h_speaker or h_speaker.startswith("!input-"):
-                continue
-            live_history.append(h_text)
-            if len(live_history) >= 5:
+            history.append(text)
+            if len(history) >= limit:
                 break
-        if not live_history:
-            live_history = []
+        return history
 
-        live_history_tokens = [BM25Searcher.tokenize(t) for t in live_history]
-        decay_weights = HISTORY_DECAY_WEIGHTS
+    def _context_score(self, idx: int) -> float:
+        tokens: list[str] = []
+        sentences = self.memory["sentence"]
+        for j in range(max(0, idx - 4), idx):
+            if _is_user_entry(sentences[j]):
+                tokens.extend(tokenize_ngrams(_entry_text(sentences[j])))
+        return self.index.cosine(self.index.query_vector(tokens), idx)
 
-        # 候補ごとに、候補発言より前にあるユーザー発言列との一致を測る。
-        def previous_user_history(target_idx, limit=5):
-            history = []
-            for j in range(target_idx - 1, -1, -1):
-                entry = sentences[j]
-                if is_system_or_marker(entry):
-                    continue
-                speaker = str(entry[1])
-                if speaker in bot_names or speaker.startswith("!output"):
-                    continue
-                if "!system" in speaker or speaker.startswith("!input-"):
-                    continue
-                text = entry[0]
-                if isinstance(text, str) and text.strip():
-                    history.append(text)
-                    if len(history) >= limit:
-                        break
-            return history
+    def _history_score(self, idx: int, history_vectors: list[dict[str, float]]) -> float:
+        """候補の直前のユーザー発言と、実際の直近会話の近さ (古いほど減衰)"""
+        if not history_vectors:
+            return 0.0
+        cfg = self.config
+        sentences = self.memory["sentence"]
+        score = 0.0
+        k = 0
+        pos = idx - 1
+        floor = max(0, idx - cfg.history_lookback)
+        while pos >= floor and k < len(history_vectors):
+            if _is_user_entry(sentences[pos]):
+                score += self.index.cosine(history_vectors[k], pos) * cfg.history_decay_weights[k]
+                k += 1
+            pos -= 1
+        return score
 
-        chara_style_query = BM25Searcher.tokenize(self.chara_style)
-        scored = []
-        for text_score, idx in candidates:
-            # 文脈スコアは入力単体より弱く扱い、極端な加点を避ける。
-            context_tokens = []
-            # 候補直前の発言を使い、存在しないself.messagesには依存しない。
-            for j in range(max(0, idx - 4), idx):
-                previous_text = sentences[j][0]
-                previous_speaker = str(sentences[j][1])
-                if (isinstance(previous_text, str) and previous_text.strip()
-                        and previous_speaker not in bot_names
-                        and "!system" not in previous_speaker
-                        and previous_text not in ("!good", "!bad")):
-                    context_tokens.extend(BM25Searcher.tokenize(previous_text))
-            context_score = self.bm25.get_score(context_tokens, idx) if context_tokens else 0.0
+    def _score_candidates(
+        self, candidates: list[tuple[float, int]], x: str, u: str
+    ) -> list[_Candidate]:
+        cfg = self.config
 
-            memory_history = previous_user_history(idx, limit=5)
-            history_score = 0.0
-            matched = min(len(live_history_tokens), len(memory_history), len(decay_weights))
-            for k in range(matched):
-                query_tokens = live_history_tokens[k]
-                if not query_tokens:
-                    continue
-                # 新しい履歴ほど大きな重み。候補の直前から順に対応させる。
-                memory_pos = idx - 1
-                seen = 0
-                while memory_pos >= 0 and seen <= k:
-                    entry = sentences[memory_pos]
-                    if not is_system_or_marker(entry):
-                        speaker = str(entry[1])
-                        if (speaker not in bot_names and not speaker.startswith("!input-")
-                                and "!system" not in speaker):
-                            if seen == k:
-                                break
-                            seen += 1
-                    memory_pos -= 1
-                if memory_pos >= 0:
-                    history_score += self.bm25.get_score(query_tokens, memory_pos) * decay_weights[k]
+        history_vectors: list[dict[str, float]] = []
+        if cfg.history_score_weight:
+            history_vectors = [
+                self.index.query_vector(tokenize_ngrams(text))
+                for text in self._recent_user_utterances(x, u)
+            ]
+        style_vector: dict[str, float] = {}
+        if cfg.chara_style_weight and self.chara_style:
+            style_vector = self.index.query_vector(tokenize_ngrams(self.chara_style))
 
-            chara_style_score = self.bm25.get_score(chara_style_query, idx+1)
-            scored.append({
-                "idx": idx,
-                "text": text_score,
-                "context": context_score,
-                "history": history_score,
-                "good": self._has_good_tag(idx),
-                "chara_style": chara_style_score,
-            })
+        items = [
+            _Candidate(
+                idx=idx,
+                text=text_score,
+                good=self._has_good_tag(idx),
+                context=self._context_score(idx) if cfg.context_score_weight else 0.0,
+                history=self._history_score(idx, history_vectors),
+                style=self.index.cosine(style_vector, idx + 1) if style_vector else 0.0,
+            )
+            for text_score, idx in candidates
+        ]
 
-        if not scored:
+        text_norm = _normalize_scores([it.text for it in items])
+        context_norm = _normalize_scores([it.context for it in items])
+        history_norm = _normalize_scores([it.history for it in items])
+        style_norm = _normalize_scores([it.style for it in items])
+
+        for i, it in enumerate(items):
+            it.final = (
+                cfg.text_score_weight * text_norm[i]
+                + cfg.context_score_weight * context_norm[i]
+                + cfg.history_score_weight * history_norm[i]
+                + (cfg.good_tag_bonus if it.good else 0.0)
+                + cfg.chara_style_weight * style_norm[i]
+            )
+        return items
+
+    def _pick_best(self, scored: list[_Candidate], force: bool) -> _Candidate | None:
+        cfg = self.config
+        top = heapq.nlargest(max(2, cfg.near_tie_pool_size), scored, key=lambda it: it.final)
+        best = top[0]
+
+        if best.text <= cfg.min_text_score:
+            logger.info("返信見送り: TF-IDF類似度が不足 (score=%.4f, force=%s)", best.text, force)
             return None
 
-        # 各特徴量はBM25値の尺度が異なるため、候補集合内で0〜1に正規化してから合成する。
-        # 注意: この正規化値は候補間の相対値であり、絶対的な確信度ではない。
-        text_norm = self._normalize_scores([item["text"] for item in scored])
-        context_norm = self._normalize_scores([item["context"] for item in scored])
-        history_norm = self._normalize_scores([item["history"] for item in scored])
-        chara_style_norm = self._normalize_scores([item["chara_style"] for item in scored])
+        # 僅差なら上位からランダムに選んで単調さを避ける
+        if len(top) >= 2 and best.final - top[1].final < cfg.near_tie_threshold:
+            pool = top[: cfg.near_tie_pool_size]
+            floor = min(it.final for it in pool)
+            weights = [max(0.05, it.final - floor + 0.15) for it in pool]
+            best = self._rng.choices(pool, weights=weights, k=1)[0]
+        return best
 
-        for i, item in enumerate(scored):
-            # 入力との一致を主軸にし、文脈・履歴・口調は補助的に加点する。
-            # !good は既存の品質優遇機構として固定ボーナスを与える。
-            item["final"] = (
-                TEXT_SCORE_WEIGHT * text_norm[i]
-                + CONTEXT_SCORE_WEIGHT * context_norm[i]
-                + HISTORY_SCORE_WEIGHT * history_norm[i]
-                + (GOOD_TAG_BONUS if item["good"] else 0.0)
-                + CHARA_STYLE_WEIGHT * chara_style_norm[i]
-            )
-
-        scored.sort(key=lambda item: item["final"], reverse=True)
-
-        # 正規化値は候補間の相対値にすぎないため、最終スコアだけでなく
-        # 入力そのものとのBM25関連度を必ず確認する。force=Trueでもここは迂回させない。
-        # これにより、文脈スコアや !good の加点だけで無関係な返信が選ばれるのを防ぐ。
-        if scored[0]["text"] <= 0.01:
-            print(
-                f"返信見送り: 入力とのBM25スコアが不足 "
-                f"(score={scored[0]['text']:.4f}, force={force})"
-            )
+    def looking(self, x: str, u: str, reply: bool = True, force: bool = False) -> str | None:
+        """過去の発言から最適な返信候補を探索"""
+        logger.info("思考中: %s", x)
+        sentences = self.memory["sentence"]
+        if len(sentences) < 2 or not isinstance(x, str) or not x.strip():
             return None
 
-        # 上位候補がほぼ同点なら、上位3件の範囲で品質寄りの重み付き抽選。
-        best = scored[0]
-        if (len(scored) >= 2 and
-                best["final"] - scored[1]["final"] < NEAR_TIE_THRESHOLD):
-            pool = scored[:min(NEAR_TIE_POOL_SIZE, len(scored))]
-            floor = min(item["final"] for item in pool)
-            weights = [max(0.05, item["final"] - floor + 0.15) for item in pool]
-            chosen = random.choices(pool, weights=weights, k=1)[0]
-            # 低スコアの候補を選んだ場合も、選択された候補の値を一貫して使う。
-            best = chosen
+        self._ensure_index()
+        query_tokens = list(dict.fromkeys(tokenize_ngrams(x)))
+        if not query_tokens:
+            return None
 
-        best_idx = best["idx"]
-        response = sentences[best_idx + 1]
-        is_good_mark = " [★good優遇]" if best["good"] else ""
-        print(
-            f"類似: {sentences[best_idx][0]}, idx: {best_idx}, "
-            f"BM25: {best['text']:.4f}, context: {best['context']:.4f}, "
-            f"history: {best['history']:.4f}, style: {best['chara_style']:.4f}, "
-            f"FinalScore: {best['final']:.3f}"
-            f"{is_good_mark}, force={force}"
+        candidates = self._collect_candidates(query_tokens)
+        if not candidates:
+            logger.info("検索候補なし: TF-IDF類似度が閾値以下です (force=%s)", force)
+            return None
+
+        best = self._pick_best(self._score_candidates(candidates, x, u), force)
+        if best is None:
+            return None
+
+        source, response = sentences[best.idx], sentences[best.idx + 1]
+        logger.info(
+            "類似: %s, idx: %d, TF-IDF: %.4f, context: %.4f, history: %.4f, "
+            "style: %.4f, final: %.3f%s, force=%s",
+            source[0], best.idx, best.text, best.context, best.history, best.style,
+            best.final, " [★good優遇]" if best.good else "", force,
         )
-        print(f"返信: {response[0]}, idx: {best_idx + 1}")
+        logger.info("返信: %s, idx: %d", response[0], best.idx + 1)
 
-        self.last_input_similar = sentences[best_idx][0]
-        self.last_input_similar_user = sentences[best_idx][1]
-        self.heart = best_idx + 1
+        self.last_input_similar = source[0]
+        self.last_input_similar_user = source[1]
+        self.heart = best.idx + 1
         self.last_bot_base_user = response[1]
         self.last_bot_base = response[0]
         return response[0]
 
+    # ------------------------------------------------------------------
+    # 単語置換
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _diff_replacements(before_tokens: list[str], after_tokens: list[str]) -> list[tuple[str, str]]:
+        """before -> after の差分から (旧, 新) の置換ペアを取り出す"""
+        pairs: list[tuple[str, str]] = []
+        old = new = ""
+        for diff in difflib.ndiff(before_tokens, after_tokens):
+            tag, content = diff[:2], diff[2:]
+            if tag == "- ":
+                old += content
+            elif tag == "+ ":
+                new += content
+            elif tag == "  ":
+                if (old or new) and len(old) >= 2:
+                    pairs.append((old, new))
+                old = new = ""
+        if (old or new) and len(old) >= 2:
+            pairs.append((old, new))
+        return pairs
+
+    def _is_similar_word(self, token: str, old: str) -> bool:
+        if Levenshtein.normalized_similarity(token, old) >= REPLACE_CHAR_SIMILARITY:
+            return True
+        return self.semantic_learner.calculate_similarity(token, old) >= REPLACE_SEMANTIC_SIMILARITY
+
+    def _remember_replacement(self, after: str, before: str):
+        self.word_replacer_memory_after.append(after)
+        self.word_replacer_memory_before.append(before)
+
+    def _truncate_replacer_memory(self):
+        """置換履歴のサイズ制御"""
+        limit = self.maximum_word_replacer_memory * (len(self.my_names) + 1)
+        self.word_replacer_memory_after = self.word_replacer_memory_after[-limit:]
+        self.word_replacer_memory_before = self.word_replacer_memory_before[-limit:]
+        self.memory["word_replacer_memory_after"] = self.word_replacer_memory_after
+        self.memory["word_replacer_memory_before"] = self.word_replacer_memory_before
+
+    def _remember_speaker_replacements(self, speaker: str):
+        """話者名の置換 (入力者 <-> 類似発言の話者 / 自分の名前) を履歴に残す"""
+        if "!system" in speaker:
+            return
+        similar = self.last_input_similar_user
+        speaker_is_bot = speaker in BOT_OUTPUT_SPEAKERS
+        similar_is_bot = similar in BOT_OUTPUT_SPEAKERS
+
+        if not speaker_is_bot and not similar_is_bot:
+            self._remember_replacement(speaker, similar)
+        elif similar_is_bot and not speaker_is_bot:
+            for name in self.my_names:
+                self._remember_replacement(speaker, name)
+        elif speaker_is_bot and not similar_is_bot:
+            for name in self.my_names:
+                self._remember_replacement(name, similar)
 
     # ------------------------------------------------------------------
-    # 会話フロー
+    # 会話の入出力
     # ------------------------------------------------------------------
-    def record(self):
-        if self.current_voice:
-            self.learnSentence(self.current_voice, "!")
-            self.evalute()
-        
-    def speakFreely(self, is_active_learning=True):
-        result = self.current_voice
-        if "!" not in self.last_user:
-            self.last_userReplied = self.last_user
-        self.user_log.append("!")
+    def _push_log(self, text: str, speaker: str):
+        entry = [text, speaker]
+        if entry != self.latest_log[-1]:
+            self.latest_log.append(entry)
+        if len(self.latest_log) > LOG_LIMIT:
+            self.latest_log = self.latest_log[-LOG_LIMIT:]
+
+    def _push_user_log(self, value: str):
+        self.user_log.append(value)
         self.user_log.pop(0)
-        if result is not None:
-            self.word_replacer_memory_after.append(result)
-            self.word_replacer_memory_before.append(self.last_bot_base)
-            if self.last_bot_base_user in ["!", "!output"]:
-                for myname in self.settings["mynames"].split("|"):
-                    self.word_replacer_memory_after.append(myname)
-                    self.word_replacer_memory_before.append(self.last_bot_base_user)
-            if len(self.word_replacer_memory_after) > self.maximum_word_replacer_memory:
-                self.word_replacer_memory_after = self.word_replacer_memory_after[-self.maximum_word_replacer_memory:]
-            if len(self.word_replacer_memory_before) > self.maximum_word_replacer_memory:
-                self.word_replacer_memory_before = self.word_replacer_memory_before[-self.maximum_word_replacer_memory:]
-            self.memory["word_replacer_memory_after"] = self.word_replacer_memory_after
-            self.memory["word_replacer_memory_before"] = self.word_replacer_memory_before
+
+    def _mark_bot_turn(self):
+        if "!" not in self.last_user:
+            self.last_user_replied = self.last_user
+            self._push_user_log("!")
+
+    def _insert_feedback_marker(self, x: str):
+        """!good / !bad を、直前に返した発言の直後に挿入する"""
+        if x not in SYSTEM_MARKERS:
+            return
+        sentences = self.memory["sentence"]
+        pos = self.heart + 1
+        if pos < len(sentences) and sentences[pos][0] != x:
+            sentences.insert(pos, [x, "!system"])
+            self.index.invalidate()  # 途中挿入でidxがずれるため全再構築
+
+    def speak_freely(self, is_active_learning: bool = True) -> str | None:
+        result = self.current_voice
+        self._mark_bot_turn()
+        if result is None:
+            return None
+
+        self._remember_replacement(result, self.last_bot_base)
+        if self.last_bot_base_user in BOT_OUTPUT_SPEAKERS:
+            for name in self.my_names:
+                self._remember_replacement(name, self.last_bot_base_user)
+        self._truncate_replacer_memory()
 
         self.last_previous_input_user = self.last_input_user
         self.last_previous_input_content = self.last_input_content
         self.last_bot_response = result
-        if [result, "!"] != self.latest_log[-1]:
-            self.latest_log.append([result, "!"])
-        if len(self.latest_log) > 9:
-            self.latest_log = self.latest_log[-9:]
+        self._push_log(result, "!")
         return result
 
-    def nextSpeak(self, is_active_learning=True):
-        if self.isNextOk():
-            self.heart += 1
-            result = self.memory["sentence"][self.heart][0]
-            self.last_bot_base = result
-            self.last_bot_base_user = self.memory["sentence"][self.heart][1]
-            if "!" not in self.last_user:
-                self.last_userReplied = self.last_user
-            self.user_log.append("!")
-            self.user_log.pop(0)
-            if result is not None:
-                result = self.replaceWords(result, self.word_replacer_memory_after, self.word_replacer_memory_before)
-
-                self.word_replacer_memory_after.append(result)
-                self.word_replacer_memory_before.append(self.last_bot_base)
-                for myname in reversed(self.settings["mynames"].split("|")):
-                    self.word_replacer_memory_after.append(myname)
-                    self.word_replacer_memory_before.append(self.last_bot_base_user)
-                limit = self.maximum_word_replacer_memory * (len(self.settings["mynames"].split("|")) + 1)
-                self.word_replacer_memory_after = self.word_replacer_memory_after[-limit:]
-                self.word_replacer_memory_before = self.word_replacer_memory_before[-limit:]
-                self.memory["word_replacer_memory_after"] = self.word_replacer_memory_after
-                self.memory["word_replacer_memory_before"] = self.word_replacer_memory_before
-
-            self.last_bot_response = result
-            return result
-        else:
+    def next_speak(self, is_active_learning: bool = True) -> str | None:
+        if not self.is_next_ok():
             return None
 
-    def receive(self, x, u, is_active_learning=True, reply=True, force=False):
+        self.heart += 1
+        base_text, base_user = self.memory["sentence"][self.heart][:2]
+        self.last_bot_base = base_text
+        self.last_bot_base_user = base_user
+        self._mark_bot_turn()
+
+        result = self.contextual_word_replacer.execute_replace(
+            base_text, self.word_replacer_memory_after, self.word_replacer_memory_before, self.tokenizer.tokenize
+        )
+        self._remember_replacement(result, base_text)
+        for name in reversed(self.my_names):
+            self._remember_replacement(name, base_user)
+        self._truncate_replacer_memory()
+
+        self.last_bot_response = result
+        return result
+
+    def receive(
+        self,
+        x: str,
+        u: str,
+        is_active_learning: bool = True,
+        reply: bool = True,
+        force: bool = False,
+    ) -> str | None:
         if x is None or u is None:
             return None
-        
+
         self.pre_heart = self.heart
         self.last_input_content = x
         self.last_input_user = u
+
         if "!" not in u:
             self.last_user = u
-            self.user_log.append(u)
-            self.user_log.pop(0)
-        
+            self._push_user_log(u)
+
         if is_active_learning:
-            self.learnSentence(x, u)
-            if x == "!bad" and self.memory["sentence"][self.heart+1][0] != "!bad":
-                self.memory["sentence"].insert(self.heart+1, ["!bad", "!"])
-            if x == "!good" and self.memory["sentence"][self.heart+1][0] != "!good":
-                self.memory["sentence"].insert(self.heart+1, ["!good", "!"])
-        if [x, u] != self.latest_log[-1]:
-            self.latest_log.append([x, u])
-        if len(self.latest_log) > 9:
-            self.latest_log = self.latest_log[-9:]
-        result = self.looking(x, u, force=force, reply=reply)
-        
+            self.learn_sentence(x, u)
+        self._insert_feedback_marker(x)
+        self._push_log(x, u)
+
+        result = self.looking(x, u, reply=reply, force=force)
         if result is None:
             self.current_voice = None
             return None
 
-        self.word_replacer_memory_after.append(x)
-        self.word_replacer_memory_before.append(self.last_input_similar)
+        self._remember_replacement(x, self.last_input_similar)
+        self._remember_speaker_replacements(u)
+        self._truncate_replacer_memory()
 
-        if "!system" not in u:
-            if u not in ["!", "!output"] and self.last_input_similar_user not in ["!", "!output"]:
-                self.word_replacer_memory_after.append(u)
-                self.word_replacer_memory_before.append(self.last_input_similar_user)
-            elif self.last_input_similar_user in ["!", "!output"] and u not in ["!", "!output"]:
-                for myname in self.settings["mynames"].split("|"):
-                    self.word_replacer_memory_after.append(u)
-                    self.word_replacer_memory_before.append(myname)
-            elif u in ["!", "!output"] and self.last_input_similar_user not in ["!", "!output"]:
-                for myname in self.settings["mynames"].split("|"):
-                    self.word_replacer_memory_after.append(myname)
-                    self.word_replacer_memory_before.append(self.last_input_similar_user)
-        limit = self.maximum_word_replacer_memory * (len(self.settings["mynames"].split("|")) + 1)
-        self.word_replacer_memory_after = self.word_replacer_memory_after[-limit:]
-        self.word_replacer_memory_before = self.word_replacer_memory_before[-limit:]
-
-        result = self.replaceWords(result, self.word_replacer_memory_after, self.word_replacer_memory_before)
+        result = self.contextual_word_replacer.execute_replace(
+            result, self.word_replacer_memory_after, self.word_replacer_memory_before, self.tokenizer.tokenize
+        )
         result = result.replace("[YOU]", self.last_user)
 
-        self.memory["word_replacer_memory_after"] = self.word_replacer_memory_after
-        self.memory["word_replacer_memory_before"] = self.word_replacer_memory_before
-            
         self.current_voice = result
-        print(f"座標: {self.heart}")
-        print(f"ログ: {self.user_log}")
-        print(f"心の声: {result}")
+        logger.info("座標: %d / ログ: %s / 心の声: %s", self.heart, self.user_log, result)
         return result
 
-    def get_settings(self):
+    # ------------------------------------------------------------------
+    # ゲッター
+    # ------------------------------------------------------------------
+    def get_settings(self) -> dict:
         return self.settings
-    
-    def get_memory(self):
+
+    def get_memory(self) -> dict:
         return self.memory
-    
-    def get_current_voice(self):
+
+    def get_current_voice(self) -> str | None:
         return self.current_voice
-    
-    def get_last_bot_response(self):
+
+    def get_last_bot_response(self) -> str:
         return self.last_bot_response
-    
-    def get_last_user(self):
+
+    def get_last_user(self) -> str:
         return self.last_user
 
 
 if __name__ == "__main__":
-    a = Himawaria("kasen")
-    print(a.receive("こんにちは", "ユーザー", True))
-    print(a.receive("調子はどう？", "ユーザー", True))
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Himawaria 動作テスト")
+    parser.add_argument("directory", nargs="?", default="kasen", help="記憶ディレクトリ")
+    parser.add_argument("--log-file", help="ログをこのファイルにも書き出す")
+    parser.add_argument("--quiet", action="store_true", help="ログをWARNING以上だけにする")
+    args = parser.parse_args()
+
+    setup_logging(logging.WARNING if args.quiet else logging.INFO, args.log_file)
+    bot = Himawaria(args.directory)
+
+    print("--- 初期学習中 ---")
+    bot.update_tfidf_index()
+
+    print("\n--- 会話テスト ---")
+    print("応答:", bot.receive("こんにちは", "ユーザー", is_active_learning=True))
+
+    print("\n--- 単語の演算テスト ---")
+    for word, score in bot.semantic_learner.arithmetic(
+        positive=["王様", "女"], negative=["男"], top_n=3
+    ):
+        print(f"  単語: {word} (意味類似度: {score:.4f})")
