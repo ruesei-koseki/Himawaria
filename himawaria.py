@@ -277,7 +277,7 @@ class NgramTokenizer:
 class SelfSemanticLearner:
     """記憶内の共起関係からPPMI意味ベクトルを自給自足するクラス"""
 
-    def __init__(self, window_size: int = 2):
+    def __init__(self, window_size: int = 12):
         self.window_size = window_size
         self.vocab: set[str] = set()
         self.co_occurrence: dict[str, Counter] = {}
@@ -663,7 +663,7 @@ class Himawaria:
         self.latest_log: list = [["init", "init"]]
 
         self.tokenizer = NgramTokenizer()
-        self.semantic_learner = SelfSemanticLearner(window_size=2)
+        self.semantic_learner = SelfSemanticLearner(window_size=12)
         self.index = TfidfIndex()
         self.contextual_word_replacer = ContextualWordReplacer(semantic_learner=self.semantic_learner)
         self._semantic_trained_size: int | None = None
