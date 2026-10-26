@@ -1166,9 +1166,8 @@ class Himawaria:
             return None
 
         self._remember_replacement(result, self.last_bot_base)
-        if self.last_bot_base_user in BOT_OUTPUT_SPEAKERS:
-            for name in self.my_names:
-                self._remember_replacement(name, self.last_bot_base_user)
+        for name in self.my_names:
+            self._remember_replacement(name, self.last_bot_base_user)
         self._truncate_replacer_memory()
 
         self.last_previous_input_user = self.last_input_user
