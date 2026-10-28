@@ -170,13 +170,29 @@ def _is_user_entry(entry) -> bool:
 # トークナイザー
 # ---------------------------------------------------------------------------
 class NgramTokenizer:
-    """文字の結合度を学習し、単語置換処理で使うトークナイザー。"""
+    """文字の結合度(PMI)を学習し、単語置換処理で使うトークナイザー。
+
+    - 登録単語 (話者名など) は周りの文字に関係なく、必ず1トークンとして切り出す。
+    - それ以外は、隣り合う2文字のPMIが閾値未満の所、または前後より明確に
+      落ち込んでいる所で区切る。(閾値だけだと、記憶にある文はほぼ全部が
+      高PMIになり、文全体が1トークンになってしまう)
+    """
+
+    DIP_MARGIN = 1.0  # 前後のPMIよりこれ以上低ければ「語の切れ目」とみなす
+    MIN_FORCED_LEN = 2  # 1文字の登録語は本文を細切れにしすぎるので受け付けない
 
     def __init__(self):
         self.char_counts: Counter = Counter()
         self.bigram_counts: Counter = Counter()
         self.forced_words: set[str] = set()
-        self._forced_prefixes: set[str] = set()
+        self._forced_index: dict[str, list[int]] = {}  # 先頭文字 -> 長い順の語長
+        self._total_chars = 0
+        self._total_bigrams = 0
+
+    def _recount(self):
+        """PMIの分母になる合計値を数え直す (毎回sum()すると非常に遅い)"""
+        self._total_chars = sum(self.char_counts.values())
+        self._total_bigrams = sum(self.bigram_counts.values())
 
     def train(self, corpus: Iterable[str]):
         """1文字と2文字の出現頻度をカウント"""
@@ -187,61 +203,119 @@ class NgramTokenizer:
             self.bigram_counts.update(
                 sentence[i : i + 2] for i in range(len(sentence) - 1)
             )
+            self._total_chars += len(sentence)
+            self._total_bigrams += len(sentence) - 1
 
     def register_words(self, words: Iterable[str]):
-        """分割してほしくない単語を登録する"""
+        """分割してほしくない単語 (話者名など) を登録する"""
+        changed = False
         for word in words:
-            if not word:
+            if not word or len(word) < self.MIN_FORCED_LEN or word in self.forced_words:
                 continue
             self.forced_words.add(word)
-            self._forced_prefixes.update(word[:i] for i in range(1, len(word) + 1))
+            changed = True
+        if changed:
+            index: dict[str, set[int]] = {}
+            for word in self.forced_words:
+                index.setdefault(word[0], set()).add(len(word))
+            self._forced_index = {c: sorted(lens, reverse=True) for c, lens in index.items()}
 
     def _cohesion(self, c1: str, c2: str) -> float:
         """2文字の結合度 (条件付き確率 P(c2|c1))"""
         char_count = self.char_counts.get(c1, 0)
         bigram_count = self.bigram_counts.get(c1 + c2, 0)
         return bigram_count / char_count if char_count and bigram_count else 0.0
-    
+
     def _pmi(self, c1: str, c2: str) -> float:
         """2文字の相互情報量 (PMI) を計算。文字種に依存せず、統計的な結合度を測る。"""
         bigram_count = self.bigram_counts.get(c1 + c2, 0)
-        if bigram_count == 0:
+        if bigram_count == 0 or not self._total_chars or not self._total_bigrams:
             return 0.0
-            
-        total_chars = sum(self.char_counts.values())
-        p_x = self.char_counts.get(c1, 0) / total_chars
-        p_y = self.char_counts.get(c2, 0) / total_chars
-        p_xy = bigram_count / sum(self.bigram_counts.values())
-        
+
+        p_x = self.char_counts.get(c1, 0) / self._total_chars
+        p_y = self.char_counts.get(c2, 0) / self._total_chars
+        p_xy = bigram_count / self._total_bigrams
+
         # PMI = log2( P(x,y) / (P(x)*P(y)) )
         return math.log2(p_xy / (p_x * p_y + 1e-10))
 
-    def tokenize(self, text: str, drop_threshold: float = 1.0) -> list[str]:
-        """アプリオリな文字種分断を一切行わず、PMI（統計的結びつき）のみで単語をtokenizeする"""
-        if not text:
-            return []
-        if len(text) == 1:
-            return [text]
-
-        words: list[str] = []
-        current = text[0]
-        
-        # 記憶全体のPMIの平均的な閾値を自動調整（あるいは固定のdrop_thresholdを使用）
-        for c1, c2 in zip(text, text[1:]):
-            candidate = current + c2
-            
-            # 強制登録単語のプレフィックスであるか、または統計的な結合度(PMI)が閾値以上か
-            # ※記号やスペース、数字の並びであっても、ログに一塊で存在するならPMIは高くなる
-            if candidate in self._forced_prefixes or self._pmi(c1, c2) >= drop_threshold:
-                current = candidate
+    def _segments(
+        self, text: str, index: dict[str, list[int]], words: set[str]
+    ) -> list[tuple[str, bool]]:
+        """登録単語(最長一致)とそれ以外に分ける。 [(文字列, 登録単語か)]"""
+        segments: list[tuple[str, bool]] = []
+        start = 0  # 未確定の通常テキストの開始位置
+        i = 0
+        n = len(text)
+        while i < n:
+            matched = 0
+            for length in index.get(text[i], ()):
+                if text[i : i + length] in words:
+                    matched = length
+                    break
+            if matched:
+                if start < i:
+                    segments.append((text[start:i], False))
+                segments.append((text[i : i + matched], True))
+                i += matched
+                start = i
             else:
-                # 統計的に結合が切れる（独立性が高い）場所でのみ区切る
-                words.append(current)
-                current = c2
-                
-        words.append(current)
+                i += 1
+        if start < n:
+            segments.append((text[start:], False))
+        return segments
+
+    def _split_by_pmi(self, text: str, drop_threshold: float) -> list[str]:
+        if len(text) <= 1:
+            return [text] if text else []
+
+        scores = [self._pmi(a, b) for a, b in zip(text, text[1:])]
+        last = len(scores) - 1
+        words: list[str] = []
+        start = 0
+        for i, score in enumerate(scores):  # i は text[i] と text[i+1] の境目
+            cut = score < drop_threshold
+            if not cut and 0 < i < last:
+                # 両隣より明確に結合が弱い所も語の切れ目とする
+                cut = score <= min(scores[i - 1], scores[i + 1]) - self.DIP_MARGIN
+            if cut:
+                words.append(text[start : i + 1])
+                start = i + 1
+        words.append(text[start:])
         return words
 
+    def tokenize(
+        self,
+        text: str,
+        drop_threshold: float = 1.0,
+        extra_words: Iterable[str] | None = None,
+    ) -> list[str]:
+        """登録単語を先に切り出し、残りをPMI（統計的結びつき）でtokenizeする。
+
+        extra_words はこの呼び出しだけ有効な追加の登録単語。置換したい語が
+        助詞とくっついて1トークンになっていても、必ず単独で切り出せる。
+        """
+        if not text:
+            return []
+
+        index, words = self._forced_index, self.forced_words
+        extras = {w for w in (extra_words or ()) if w and w in text}
+        if extras:
+            words = words | extras
+            lengths: dict[str, set[int]] = {c: set(ls) for c, ls in index.items()}
+            for word in extras:
+                lengths.setdefault(word[0], set()).add(len(word))
+            index = {c: sorted(ls, reverse=True) for c, ls in lengths.items()}
+        if not index:
+            return self._split_by_pmi(text, drop_threshold)
+
+        tokens: list[str] = []
+        for segment, forced in self._segments(text, index, words):
+            if forced:
+                tokens.append(segment)
+            else:
+                tokens.extend(self._split_by_pmi(segment, drop_threshold))
+        return tokens
 
     def save(self, file_path: Path | str):
         data = {
@@ -257,8 +331,9 @@ class NgramTokenizer:
             data = json.load(f)
         self.char_counts = Counter(data.get("char_counts", {}))
         self.bigram_counts = Counter(data.get("bigram_counts", {}))
+        self._recount()
         self.forced_words.clear()
-        self._forced_prefixes.clear()
+        self._forced_index = {}
         self.register_words(data.get("forced_words", []))
         logger.info("トークナイザーモデルを読み込みました: %s", file_path)
 
@@ -268,6 +343,7 @@ class NgramTokenizer:
             data = pickle.load(f)
         self.char_counts = Counter(data.get("char_counts", {}))
         self.bigram_counts = Counter(data.get("bigram_counts", {}))
+        self._recount()
         logger.info("旧形式のトークナイザーモデルを読み込みました: %s", file_path)
 
 
@@ -501,13 +577,85 @@ class _Candidate:
 class ContextualWordReplacer:
     """文脈を考慮したトークンベースの単語置換エンジン"""
 
-    def __init__(self, semantic_learner, char_sim=0.85, sem_sim=0.75):
+    # 置換ルールとして採用する大きさの範囲。
+    # 文全体が丸ごと入れ替わるような差分や、1文字だけの差分 (「は」→「が」など)
+    # をルールにすると、無関係な箇所まで書き換えてしまうので捨てる。
+    MIN_RULE_CHARS = 2
+    MAX_RULE_CHARS = 16
+    MAX_RULE_TOKENS = 4
+
+    def __init__(self, semantic_learner, char_sim=0.85, sem_sim=0.75, protected_words=None):
         self.semantic_learner = semantic_learner
         self.char_sim = char_sim
         self.sem_sim = sem_sim
+        # 名前など。これらは完全一致のときしか置換しない (「花子」と「次郎」は
+        # 文脈が似ているので、意味ベクトルの類似度で曖昧一致させると取り違える)
+        self.protected_words = protected_words if protected_words is not None else set()
+        self._rule_cache: dict[tuple, list[dict]] = {}
+
+    MIN_ANCHOR_CHARS = 2  # 差分の前後で、これ以上続く共通部分だけを「変わっていない部分」とみなす
+    RULE_CACHE_SIZE = 4096
+
+    @staticmethod
+    def _is_ideograph(text: str) -> bool:
+        """漢字1文字 (「猫」「車」など。1文字でも単語として置換してよい)"""
+        return len(text) == 1 and "一" <= text <= "鿿"
+
+    def _is_usable_rule(self, old_tokens: list[str], new_tokens: list[str]) -> bool:
+        old_text, new_text = "".join(old_tokens), "".join(new_tokens)
+        if not new_text or old_text == new_text:
+            return False
+        if len(old_text) < self.MIN_RULE_CHARS and not self._is_ideograph(old_text):
+            return False
+        if len(old_tokens) > self.MAX_RULE_TOKENS or len(new_tokens) > self.MAX_RULE_TOKENS:
+            return False
+        return max(len(old_text), len(new_text)) <= self.MAX_RULE_CHARS
+
+    def _core_pairs(self, old: str, new: str) -> list[tuple[str, str, bool]]:
+        """入れ替わった部分だけを [(旧, 新, 全体が入れ替わったか)] で取り出す。
+
+        トークンの切れ目が文ごとにずれると、「猫ばかり」→「水泳ばかり」や
+        「寿司が好きですよ」→「茶道が好きです」のように、助詞や文末ごと
+        入れ替わった形で差分が出る。文字単位で比べ、2文字以上続く共通部分を
+        「変わっていない部分」として除くと、「猫」→「水泳」「寿司」→「茶道」が取れる。
+        1文字だけの共通部分 (「電車」→「電話」の「電」など) は語の一部なので除かない。
+        """
+        anchor = self.MIN_ANCHOR_CHARS
+        spans: list[list[int]] = []  # [旧の開始, 旧の終了, 新の開始, 新の終了]
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+            if tag == "equal":
+                continue
+            if spans and i1 - spans[-1][1] < anchor:  # 間の共通部分が短い → 同じ差分として繋ぐ
+                spans[-1][1], spans[-1][3] = i2, j2
+            else:
+                spans.append([i1, i2, j1, j2])
+        if not spans:
+            return []
+
+        first, last = spans[0], spans[-1]
+        if 0 < first[0] < anchor and first[0] == first[2]:  # 先頭の短い共通部分も取り込む
+            first[0] = first[2] = 0
+        tail_old, tail_new = len(old) - last[1], len(new) - last[3]
+        if 0 < tail_old < anchor and tail_old == tail_new:  # 末尾の短い共通部分も取り込む
+            last[1], last[3] = len(old), len(new)
+
+        return [
+            (old[i1:i2], new[j1:j2], i1 == 0 and i2 == len(old) and j1 == 0 and j2 == len(new))
+            for i1, i2, j1, j2 in spans
+        ]
 
     def extract_token_replacements(self, before_tokens: list[str], after_tokens: list[str]) -> list[dict]:
-        """文字ではなく『トークン単位』で正確な置換ペアと、その左右の広い文脈（計12トークン）を抽出する"""
+        """置換ルールを抽出する。履歴はほぼ毎回同じ内容なので結果を使い回す。"""
+        key = (tuple(before_tokens), tuple(after_tokens))
+        rules = self._rule_cache.get(key)
+        if rules is None:
+            if len(self._rule_cache) >= self.RULE_CACHE_SIZE:
+                self._rule_cache.clear()
+            rules = self._rule_cache[key] = self._extract_token_replacements(before_tokens, after_tokens)
+        return rules
+
+    def _extract_token_replacements(self, before_tokens: list[str], after_tokens: list[str]) -> list[dict]:
+        """トークン単位で置換ペアと、その左右の広い文脈（計12トークン）を抽出する"""
         replacements = []
         matcher = difflib.SequenceMatcher(None, before_tokens, after_tokens)
         
@@ -518,22 +666,27 @@ class ContextualWordReplacer:
             if tag == 'replace':
                 old_tokens = before_tokens[i1:i2]
                 new_tokens = after_tokens[j1:j2]
-                
+
                 # 左右6トークンずつの環境（文脈）を保存（インデックスの範囲外はBOS/EOSでパディング）
                 left_context = before_tokens[max(0, i1 - WINDOW_SIZE):i1]
                 if i1 - WINDOW_SIZE < 0:
                     left_context = ["<BOS>"] * (WINDOW_SIZE - i1) + left_context
-                    
+
                 right_context = before_tokens[i2:min(len(before_tokens), i2 + WINDOW_SIZE)]
                 if i2 + WINDOW_SIZE > len(before_tokens):
                     right_context = right_context + ["<EOS>"] * (i2 + WINDOW_SIZE - len(before_tokens))
-                
-                replacements.append({
-                    "old": old_tokens,
-                    "new": new_tokens,
-                    "left": left_context,   # 12トークンのリスト
-                    "right": right_context  # 12トークンのリスト
-                })
+
+                for old_core, new_core, whole in self._core_pairs("".join(old_tokens), "".join(new_tokens)):
+                    # 全体が入れ替わっているなら元のトークン列のまま、一部なら芯だけを1語として扱う
+                    rule_old, rule_new = (old_tokens, new_tokens) if whole else ([old_core], [new_core])
+                    if not self._is_usable_rule(rule_old, rule_new):
+                        continue
+                    replacements.append({
+                        "old": rule_old,
+                        "new": rule_new,
+                        "left": left_context,   # 12トークンのリスト
+                        "right": right_context  # 12トークンのリスト
+                    })
         return replacements
 
     def _match_context_and_semantics(self, tokens: list[str], idx: int, rep: dict) -> bool:
@@ -549,6 +702,8 @@ class ContextualWordReplacer:
         if not is_exact_match:
             for offset, old_w in enumerate(old_tokens):
                 target_w = tokens[idx + offset]
+                if old_w in self.protected_words or target_w in self.protected_words:
+                    return False
                 if Levenshtein.normalized_similarity(target_w, old_w) >= self.char_sim:
                     continue
                 if self.semantic_learner.calculate_similarity(target_w, old_w) >= self.sem_sim:
@@ -591,8 +746,10 @@ class ContextualWordReplacer:
         # 最新の履歴を優先
         all_rules.reverse()
         
-        # 入力文をトークナイズ
-        tokens = tokenizer_func(text, drop_threshold=0.4)
+        # 入力文をトークナイズ。置換したい語は、助詞などとくっついていても
+        # 単独のトークンとして切り出す (でないとルールと照合できない)
+        targets = {rule["old"][0] for rule in all_rules if len(rule["old"]) == 1}
+        tokens = tokenizer_func(text, drop_threshold=0.4, extra_words=targets)
         i = 0
         while i < len(tokens):
             replaced = False
@@ -665,13 +822,18 @@ class Himawaria:
         self.tokenizer = NgramTokenizer()
         self.semantic_learner = SelfSemanticLearner(window_size=12)
         self.index = TfidfIndex()
-        self.contextual_word_replacer = ContextualWordReplacer(semantic_learner=self.semantic_learner)
+        self.contextual_word_replacer = ContextualWordReplacer(
+            semantic_learner=self.semantic_learner,
+            protected_words=self.tokenizer.forced_words,
+        )
         self._semantic_trained_size: int | None = None
         self._unsaved = 0
         self._main_is_valid = False
 
         self._load_initial_data()
         self._init_tokenizer()
+        # 話者名・自分の名前は本文中でも必ず1語として切り出す (名前置換の前提)
+        self._register_names(entry[1] for entry in self.memory["sentence"] if len(entry) >= 2)
 
         sentences = self.memory["sentence"]
         if sentences:
@@ -781,6 +943,7 @@ class Himawaria:
             speaker = "!input-" + u
         else:
             speaker = u
+        self._register_names([speaker])
 
         sentences = self.memory["sentence"]
         sentences.append([x, speaker])
@@ -1101,9 +1264,37 @@ class Himawaria:
             return True
         return self.semantic_learner.calculate_similarity(token, old) >= REPLACE_SEMANTIC_SIMILARITY
 
+    @staticmethod
+    def _person_name(speaker) -> str | None:
+        """話者IDから人間の名前を取り出す。bot・システム・予約名ならNone。"""
+        name = str(speaker)
+        if name.startswith("!input-"):
+            name = name[len("!input-"):]
+        if not name or name.startswith("!") or name in BOT_SPEAKERS:
+            return None
+        return name
+
+    def _register_names(self, speakers: Iterable[str]):
+        """話者名と自分の名前をトークナイザーに登録する (本文中で必ず1語になる)"""
+        names = {name for name in map(self._person_name, speakers) if name}
+        names.update(self.my_names)
+        self.tokenizer.register_words(names)
+
     def _remember_replacement(self, after: str, before: str):
         self.word_replacer_memory_after.append(after)
         self.word_replacer_memory_before.append(before)
+
+    def _remember_self_name(self, author) -> None:
+        """返信の元の発言者の名前 → 自分の名前、の置換を履歴に残す。
+
+        新しい履歴ほど優先されるので、複数ある自分の名前は逆順に積んで、
+        先頭の名前が最優先になるようにする。
+        """
+        name = self._person_name(author)
+        if name is None:
+            return
+        for my_name in reversed(self.my_names):
+            self._remember_replacement(my_name, name)
 
     def _truncate_replacer_memory(self):
         """置換履歴のサイズ制御"""
@@ -1117,18 +1308,17 @@ class Himawaria:
         """話者名の置換 (入力者 <-> 類似発言の話者 / 自分の名前) を履歴に残す"""
         if "!system" in speaker:
             return
-        similar = self.last_input_similar_user
-        speaker_is_bot = speaker in BOT_OUTPUT_SPEAKERS
-        similar_is_bot = similar in BOT_OUTPUT_SPEAKERS
+        speaker_name = self._person_name(speaker)
+        similar_name = self._person_name(self.last_input_similar_user)
 
-        if not speaker_is_bot and not similar_is_bot:
-            self._remember_replacement(speaker, similar)
-        elif similar_is_bot and not speaker_is_bot:
-            for name in self.my_names:
-                self._remember_replacement(speaker, name)
-        elif speaker_is_bot and not similar_is_bot:
-            for name in self.my_names:
-                self._remember_replacement(name, similar)
+        if speaker_name and similar_name:
+            self._remember_replacement(speaker_name, similar_name)
+        elif speaker_name:  # 類似発言は自分(bot)のもの
+            for my_name in reversed(self.my_names):
+                self._remember_replacement(speaker_name, my_name)
+        elif similar_name:  # 今の入力は自分(bot)のもの
+            for my_name in reversed(self.my_names):
+                self._remember_replacement(my_name, similar_name)
 
     # ------------------------------------------------------------------
     # 会話の入出力
@@ -1166,8 +1356,7 @@ class Himawaria:
             return None
 
         self._remember_replacement(result, self.last_bot_base)
-        for name in self.my_names:
-            self._remember_replacement(name, self.last_bot_base_user)
+        self._remember_self_name(self.last_bot_base_user)
         self._truncate_replacer_memory()
 
         self.last_previous_input_user = self.last_input_user
@@ -1190,8 +1379,7 @@ class Himawaria:
             base_text, self.word_replacer_memory_after, self.word_replacer_memory_before, self.tokenizer.tokenize
         )
         self._remember_replacement(result, base_text)
-        for name in reversed(self.my_names):
-            self._remember_replacement(name, base_user)
+        self._remember_self_name(base_user)
         self._truncate_replacer_memory()
 
         self.last_bot_response = result
@@ -1215,6 +1403,7 @@ class Himawaria:
         if "!" not in u:
             self.last_user = u
             self._push_user_log(u)
+        self._register_names([u])
 
         if is_active_learning:
             self.learn_sentence(x, u)
@@ -1228,6 +1417,9 @@ class Himawaria:
 
         self._remember_replacement(x, self.last_input_similar)
         self._remember_speaker_replacements(u)
+        # 返信の元の発言者が自分の名前を名乗っていたら、自分の名前に直す
+        # (これを speak_freely まで待つと、最初の1回目の返信には間に合わない)
+        self._remember_self_name(self.last_bot_base_user)
         self._truncate_replacer_memory()
 
         result = self.contextual_word_replacer.execute_replace(
