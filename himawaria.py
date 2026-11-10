@@ -5,8 +5,9 @@
 構成:
     tokenize_ngrams      -- 文字n-gram分割 (TF-IDF用)
     NgramTokenizer       -- 結合度ベースの簡易トークナイザー (単語置換用)
-    SelfSemanticLearner  -- 記憶内の共起から作るPPMI意味ベクトル (単語置換の類似判定用)
-    SemanticSpace        -- PPMI+SVDの密ベクトル空間 (単語演算・文の意味類似・検索用)
+    SemanticSpace        -- PPMI+SVDの意味空間 (単語演算・未知語のサブワード補完・SIF文ベクトル)。
+                            単語置換の類似判定・意味検索・意味スコアのすべてをここが担う
+    DenseIndex           -- 記憶の全発言の意味ベクトル行列 (意味検索用、増分更新対応)
     TfidfIndex           -- 転置索引つきTF-IDF索引 (増分更新対応)
     Himawaria            -- 学習・検索・応答の本体
 """
@@ -102,7 +103,7 @@ class SearchConfig:
 
     min_tfidf_candidate_score: float = 0.01
     good_tag_multiplier: float = 1.15
-    text_score_weight: float = 0.72
+    text_score_weight: float = 0.62
     context_score_weight: float = 0.0  # 0なら文脈スコアは計算自体をスキップ
     history_score_weight: float = 0.10
     good_tag_bonus: float = 0.04
@@ -115,11 +116,10 @@ class SearchConfig:
     min_coverage: float = 0.20  # 異なるトークンが4個以上のときだけ適用
     min_text_score: float = 0.01
     max_scored_candidates: int = 300  # TF-IDF上位だけを詳細採点する (0以下で無制限)
-    semantic_score_weight: float = 0.15  # 入力と候補の「意味の近さ」(文ベクトルのコサイン) の重み。0で無効
-    semantic_expand_neighbors: int = 2  # 入力語1つにつき、意味が近い語を何個まで検索に足すか。0で無効
-    semantic_expand_min_sim: float = 0.6  # 検索に足す語の最低類似度
-    semantic_expand_weight: float = 0.5  # 意味の近さだけで拾った候補のスコア係数 (文字の一致より控えめに)
-    semantic_expand_limit: int = 50  # 意味の近さだけで拾う候補の上限
+    semantic_score_weight: float = 0.25  # 入力と候補の「意味の近さ」(文ベクトルのコサイン) の重み。0で無効
+    dense_candidates: int = 50  # 意味ベクトルの近さだけで拾う候補の上限。0で無効
+    dense_min_sim: float = 0.55  # 意味検索の候補に入れる最低コサイン類似度
+    dense_candidate_weight: float = 0.5  # 意味だけで拾った候補の text スコア係数 (文字の一致より控えめに)
 
 
 # ---------------------------------------------------------------------------
@@ -404,250 +404,25 @@ class NgramTokenizer:
 
 
 # ---------------------------------------------------------------------------
-# 自前の意味ベクトル
-# ---------------------------------------------------------------------------
-class SelfSemanticLearner:
-    """記憶内の共起関係からPPMI意味ベクトルを自給自足するクラス"""
-
-    def __init__(self, window_size: int = 12):
-        self.window_size = window_size
-        self.vocab: set[str] = set()
-        self.co_occurrence: dict[str, Counter] = {}
-        self.word_vectors: dict[str, dict[str, float]] = {}
-        self._norms: dict[str, float] = {}
-        self.word_counts: Counter = Counter()  # 語の総出現回数
-        self.doc_freq: Counter = Counter()  # 語を含む発言の数
-        self.doc_total = 0
-        self._generic_sims: dict[str, float] = {}  # 語ベクトルと「平均ベクトル」の類似度
-        self.space = SemanticSpace(window=window_size)  # 単語演算・意味検索用の密ベクトル空間
-
-    def train_from_memory(self, sentence_pairs: Sequence, tokenizer: NgramTokenizer):
-        """memory["sentence"] の [発言, 話者] ペアから共起関係を学習する"""
-        try:
-            self.space.fit(sentence_pairs, forced_words=tokenizer.forced_words)
-        except Exception:  # 密ベクトルが作れなくても、置換用の疎ベクトルは学習する
-            logger.exception("密ベクトル空間の構築に失敗しました")
-        self.co_occurrence.clear()
-        self.vocab.clear()
-        self.word_vectors.clear()
-        self._norms.clear()
-        self.word_counts = Counter()
-        self.doc_freq = Counter()
-        self.doc_total = 0
-        self._generic_sims = {}
-
-        tokenized: list[list[str]] = []
-        word_counts: Counter = Counter()
-
-        for entry in sentence_pairs:
-            if not isinstance(entry, (list, tuple)) or len(entry) < 2:
-                continue
-            text, speaker = entry[0], entry[1]
-            if not _is_trainable(text, speaker):
-                continue
-            tokens = tokenizer.tokenize(text, drop_threshold=SEMANTIC_DROP_THRESHOLD)
-            if not tokens:
-                continue
-            tokenized.append(tokens)
-            word_counts.update(tokens)
-            self.doc_freq.update(set(tokens))
-            self.doc_total += 1
-            self.vocab.update(tokens)
-
-        window = self.window_size
-        for tokens in tokenized:
-            for i, target in enumerate(tokens):
-                contexts = self.co_occurrence.setdefault(target, Counter())
-                for j in range(max(0, i - window), min(len(tokens), i + window + 1)):
-                    if i != j:
-                        contexts[tokens[j]] += 1
-
-        total_cooc = sum(sum(ctx.values()) for ctx in self.co_occurrence.values())
-        if total_cooc == 0:
-            return
-        
-        row_totals = {
-            word: sum(contexts.values())
-            for word, contexts in self.co_occurrence.items()
-        }
-
-        col_totals: Counter = Counter()
-        for contexts in self.co_occurrence.values():
-            col_totals.update(contexts)
-
-        total_cooc = sum(row_totals.values())
-        if total_cooc == 0:
-            return
-
-        for word, contexts in self.co_occurrence.items():
-            p_x = row_totals[word] / total_cooc
-            vector: dict[str, float] = {}
-            for ctx_word, count in contexts.items():
-                p_y = col_totals[ctx_word] / total_cooc
-                p_xy = count / total_cooc
-                pmi = math.log2(p_xy / (p_x * p_y))
-                if pmi > 0:
-                    vector[ctx_word] = pmi
-            self.word_vectors[word] = vector
-
-        self._norms = {
-            word: math.sqrt(sum(v * v for v in vec.values()))
-            for word, vec in self.word_vectors.items()
-        }
-        self.word_counts = word_counts
-        self._build_generic_sims()
-        logger.info("自前意味ベクトルを構築しました。総語彙数: %d", len(self.vocab))
-
-    def _build_generic_sims(self):
-        """各語が「どこにでも出てくる平均的な語」にどれだけ似ているかを求める。
-
-        助詞・語尾の断片 (「っけ」「だった」など) は、どの語とも文脈が重なるため
-        平均ベクトルとの類似度が高い。単語演算の結果からこの成分を引いて、
-        話題に固有な語を上位に出す。
-        """
-        centroid: Counter = Counter()
-        for word, vec in self.word_vectors.items():
-            norm = self._norms.get(word, 0.0)
-            if not norm:
-                continue
-            for ctx_word, val in vec.items():
-                centroid[ctx_word] += val / norm
-        centroid_norm = math.sqrt(sum(v * v for v in centroid.values()))
-        if not centroid_norm:
-            return
-        for word, vec in self.word_vectors.items():
-            norm = self._norms.get(word, 0.0)
-            if norm:
-                self._generic_sims[word] = _sparse_dot(centroid, vec) / (centroid_norm * norm)
-
-    def calculate_similarity(self, word1: str, word2: str) -> float:
-        """意味ベクトル同士のコサイン類似度"""
-        v1 = self.word_vectors.get(word1)
-        v2 = self.word_vectors.get(word2)
-        if not v1 or not v2:
-            return 0.0
-        denom = self._norms[word1] * self._norms[word2]
-        return _sparse_dot(v1, v2) / denom if denom else 0.0
-    
-    def arithmetic(
-        self,
-        positive: list[str] | None = None,
-        negative: list[str] | None = None,
-        top_n: int = 5,
-        *,
-        min_count: int | None = None,
-        max_doc_ratio: float | None = None,
-        generic_penalty: float = 0.5,
-        min_chars: int = 2,
-    ) -> list[tuple[str, float]]:
-        """単語の演算（例: 王様 - 男 + 女）
-
-        密ベクトル空間 (SemanticSpace) が作れていればそちらで計算する。
-        min_count / max_doc_ratio が None のときは、方式ごとの既定値 (密: 2回・20% / 疎: 3回・5%)。
-        generic_penalty は疎ベクトル方式でだけ使う (密ベクトルは平均成分を学習時に除去済み)。
-
-        以下は疎ベクトル方式 (密ベクトルが使えないときのフォールバック) の説明:
-        - 入力語のベクトルは単位長に揃えてから足し引きする
-          (頻出語ほど文脈が多くベクトルが大きいので、そのままだと頻出語に引っ張られる)
-        - 候補から、出現が少なすぎる語 (min_count未満) と、多くの発言に出てくる
-          語 (max_doc_ratio超) を除く。「だった」「っけ」のような語尾・助詞の断片対策
-        - 「どこにでも出てくる平均的な語」との類似度を generic_penalty 倍して引き、
-          話題に固有な語を上位に出す
-        - 入力語を含む/入力語に含まれる語 (「ママ」に対する「ママが」など) は除く
-        """
-        if self.space.ready:
-            return self.space.arithmetic(
-                positive,
-                negative,
-                top_n,
-                min_count=2 if min_count is None else min_count,
-                max_doc_ratio=0.2 if max_doc_ratio is None else max_doc_ratio,
-                min_chars=min_chars,
-            )
-        min_count = 3 if min_count is None else min_count
-        max_doc_ratio = 0.05 if max_doc_ratio is None else max_doc_ratio
-        positive = positive or []
-        negative = negative or []
-        all_inputs = set(positive) | set(negative)
-
-        for word in all_inputs:
-            if word not in self.word_vectors:
-                logger.warning(
-                    "単語 '%s' はまだ記憶(学習データ)に存在しません。",
-                    word,
-                )
-                return []
-
-        def unit(word: str) -> dict[str, float]:
-            norm = self._norms.get(word, 0.0)
-            if not norm:
-                return {}
-            return {ctx: val / norm for ctx, val in self.word_vectors[word].items()}
-
-        # 正負のベクトルを加算・減算する (各語は単位長)
-        target: Counter = Counter()
-        for word in positive:
-            for ctx_word, val in unit(word).items():
-                target[ctx_word] += val
-        for word in negative:
-            for ctx_word, val in unit(word).items():
-                target[ctx_word] -= val
-
-        # 演算完了後に、正の値を持つ要素だけ残す
-        target = Counter({ctx_word: val for ctx_word, val in target.items() if val > 0})
-
-        norm_target = math.sqrt(sum(v * v for v in target.values()))
-        if not target or norm_target == 0:
-            return []
-
-        max_doc = max_doc_ratio * self.doc_total if self.doc_total else float("inf")
-
-        # 候補語と演算結果のコサイン類似度を計算する
-        results: list[tuple[str, float]] = []
-
-        for word, vector in self.word_vectors.items():
-            if word in all_inputs or len(word) < min_chars:
-                continue
-            if self.word_counts.get(word, 0) < min_count:
-                continue
-            if self.doc_freq.get(word, 0) > max_doc:
-                continue
-            if any(inp in word or word in inp for inp in all_inputs):
-                continue
-
-            norm_word = self._norms.get(word, 0.0)
-            if norm_word == 0:
-                continue
-            dot = _sparse_dot(target, vector)
-            if dot == 0:
-                continue
-
-            similarity = dot / (norm_target * norm_word)
-            similarity -= generic_penalty * self._generic_sims.get(word, 0.0)
-            if similarity > 0:
-                results.append((word, similarity))
-
-        return heapq.nlargest(
-            top_n,
-            results,
-            key=lambda item: item[1],
-        )
-    
-# ---------------------------------------------------------------------------
-# 密ベクトル空間 (PPMI + SVD)
+# 意味空間 (PPMI → SVD の密ベクトル + サブワード補完 + SIF文ベクトル)
 # ---------------------------------------------------------------------------
 class SemanticSpace:
-    """記憶だけから作る密な単語ベクトル空間 (PPMI → SVD)。
+    """記憶だけから作る意味空間。単語・文・検索・置換の「意味の近さ」はすべてここが担当する。
 
-    疎なPPMIベクトルは、同じ文脈語を共有しない語同士の類似度が0になり、出現の少ない語が
-    たまたまの共起に引っ張られる。ここでは次の手当てをして、少ないデータでも安定させる。
+    旧設計は「疎PPMI (置換用)」と「密SVD (検索用)」が別々に存在し、語分割も別、
+    未知語は完全に無視、という二重構造だった。ここでは1つに統合し、次の流れで作る。
 
-    - 学習から !command・通知行を除き、同一発言の繰り返しは max_repeat 回までしか数えない
-    - 語分割は NgramTokenizer.tokenize_words (文字種の切れ目+ひらがなだけPMI)
-    - 共起は同じ発言内の距離重み付き(1/距離) + 直前の発言との間(turn_weight)
-    - PPMIの文脈語確率を cds 乗で平滑化 (低頻度の文脈語がPMIを押し上げるのを抑える)
-    - SVDで dim 次元に圧縮し、平均と第1主成分を引く (どの語にも似てしまう成分を除く)
+    1. 語分割   : NgramTokenizer.tokenize_words (文字種の切れ目 + ひらがなだけPMI)
+    2. 共起     : 同じ発言内 (距離で重み付け 1/距離) + 直前の発言との間 (弱く)
+    3. PPMI     : 文脈語の確率を cds 乗で平滑化。shift で弱い関連を切り捨て
+    4. SVD      : dim 次元に圧縮 (語ベクトル = U·√S)
+    5. 後処理   : 平均と上位主成分を除去 (どの語にも似てしまう成分を消す) → 単位長
+    6. サブワード: 文字2-3gramごとの「平均ベクトル」を作り、未知語 (誤字・新語・活用違い) も
+                  含まれる文字列から近似ベクトルを合成する (fastText的な補完)
+    7. 文ベクトル: SIF重み付き平均 → 全発言に共通する第1主成分を除去 → 単位長
     """
+
+    _CHUNK = 20_000  # 文ベクトル化を一度に処理する発言数 (メモリ節約)
 
     def __init__(
         self,
@@ -655,34 +430,53 @@ class SemanticSpace:
         window: int = 5,
         min_count: int = 2,
         cds: float = 0.75,
+        shift: float = 1.0,
         turn_weight: float = 0.3,
         max_repeat: int = 2,
         max_vocab: int = 30_000,
         hira_threshold: float = 0.4,
         sif_a: float = 1e-3,
+        remove_components: int = 1,
+        sub_ngrams: tuple[int, ...] = (2, 3),
+        sub_max_df_ratio: float = 0.02,
+        oov_weight: float = 0.5,
     ):
         self.dim = dim
         self.window = max(1, min(window, 8))
         self.min_count = min_count
         self.cds = cds
+        self.shift = max(shift, 1e-9)  # 1.0で無効。大きいほど弱い共起を捨てる
         self.turn_weight = turn_weight
         self.max_repeat = max_repeat
         self.max_vocab = max_vocab
         self.hira_threshold = hira_threshold
         self.sif_a = sif_a
+        self.remove_components = remove_components
+        self.sub_ngrams = tuple(sub_ngrams)
+        self.sub_max_df_ratio = sub_max_df_ratio
+        self.oov_weight = oov_weight  # 未知語 (サブワード補完) を文ベクトルに混ぜる強さ。0で無効
 
         self.ready = False
+        self.version = 0  # 学習し直すたびに増える。密索引が作り直しの要否を判断する
         self.tokenizer: NgramTokenizer | None = None
         self.words: list[str] = []
         self.vocab: dict[str, int] = {}
-        self.embeddings = None  # (語数, dim) 各行は単位長 (係数0の語は零ベクトル)
+        self.embeddings = None  # (語数, dim) 各行は単位長
         self.counts = None
         self.doc_freq = None
         self.doc_total = 0
         self._lengths = None
-        self._weights = None  # 文ベクトルを作るときの語の重み (頻出語ほど軽い)
+        self._weights = None  # SIF重み (頻出語ほど軽い)
+        self._oov_sif = 1.0
+        self._sent_pc = None  # 文ベクトルから引く第1主成分
+        self._ngram_ids: dict[str, int] = {}
+        self._ngram_emb = None
+        self._ngram_idf = None
         self._sentence_cache: dict[str, object] = {}
 
+    # ------------------------------------------------------------------
+    # 語分割
+    # ------------------------------------------------------------------
     @staticmethod
     def _keep_token(token: str) -> bool:
         """助詞・語尾の1文字 (は・が・て…) は捨てる。漢字1文字 (猫・車) は語として残す。"""
@@ -693,12 +487,33 @@ class SemanticSpace:
             return []
         return [t for t in self.tokenizer.tokenize_words(text, self.hira_threshold) if self._keep_token(t)]
 
+    @staticmethod
+    def _usable_text(text) -> bool:
+        return (
+            isinstance(text, str)
+            and bool(text.strip())
+            and text not in SYSTEM_MARKERS
+            and not text.startswith(NOISE_PREFIXES)
+        )
+
+    # ------------------------------------------------------------------
+    # 学習
+    # ------------------------------------------------------------------
+    def train_from_memory(self, sentence_pairs: Sequence, tokenizer: NgramTokenizer):
+        """Himawaria から呼ばれる入口。失敗しても本体は止めない。"""
+        try:
+            self.fit(sentence_pairs, forced_words=tokenizer.forced_words)
+        except Exception:
+            self.ready = False
+            logger.exception("意味空間の構築に失敗しました")
+
     def fit(self, sentence_pairs: Sequence, forced_words: Iterable[str] = ()) -> None:
         """memory["sentence"] の [発言, 話者] ペアから学習し直す"""
         self.ready = False
+        self.version += 1
         self._sentence_cache = {}
         if np is None:
-            logger.warning("numpy/scipy が無いので密ベクトル空間は作りません")
+            logger.warning("numpy/scipy が無いので意味空間は作りません (意味検索・意味類似は無効)")
             return
         started = time.perf_counter()
 
@@ -729,11 +544,66 @@ class SemanticSpace:
             doc_freq.update(set(seq))
         words = [w for w, c in word_counts.most_common(self.max_vocab) if c >= self.min_count]
         if len(words) < 5:
-            logger.info("密ベクトル空間: 語彙が少なすぎるので作りません (%d語)", len(words))
+            logger.info("意味空間: 語彙が少なすぎるので作りません (%d語)", len(words))
             return
         vocab = {w: i for i, w in enumerate(words)}
 
-        # 共起: 同じ発言内 (距離で重み付け) と、直前の発言との間 (弱く)
+        cooc = self._count_cooccurrence(sequences, vocab)
+        if not cooc:
+            return
+
+        size = len(words)
+        keys = np.array(list(cooc.keys()), dtype=np.int64)
+        values = np.array(list(cooc.values()), dtype=np.float64)
+        matrix = coo_matrix((values, (keys[:, 0], keys[:, 1])), shape=(size, size)).tocsr()
+
+        # PPMI (文脈語の確率を cds 乗で平滑化、shift で弱い関連を切る)
+        total = matrix.sum()
+        row_sum = np.asarray(matrix.sum(axis=1)).ravel()
+        smoothed = row_sum ** self.cds
+        context_prob = smoothed / smoothed.sum()
+        coo = matrix.tocoo()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pmi = np.log((coo.data / total) / ((row_sum[coo.row] / total) * context_prob[coo.col]))
+        pmi = np.where(np.isfinite(pmi), np.maximum(pmi - math.log(self.shift), 0.0), 0.0)
+        ppmi = coo_matrix((pmi, (coo.row, coo.col)), shape=(size, size)).tocsr()
+        ppmi.eliminate_zeros()
+
+        # SVD で圧縮
+        k = min(self.dim, size - 1)
+        if k < 2 or ppmi.nnz == 0:
+            return
+        try:
+            u, s, _ = svds(ppmi, k=k, random_state=0)
+        except Exception:  # ARPACKが収束しないとき。小さければ素直に全部分解する
+            if size > 4000:
+                logger.exception("SVDに失敗しました")
+                return
+            u, s, _ = np.linalg.svd(ppmi.toarray(), full_matrices=False)
+            u, s = u[:, :k], s[:k]
+        emb = self._postprocess(u * np.sqrt(np.maximum(s, 0.0)))
+
+        counts = np.array([word_counts[w] for w in words], dtype=np.float64)
+        self.words = words
+        self.vocab = vocab
+        self.embeddings = emb.astype(np.float32)
+        self.counts = counts
+        self.doc_freq = np.array([doc_freq[w] for w in words], dtype=np.float64)
+        self.doc_total = len(sequences)
+        self._lengths = np.array([len(w) for w in words])
+        probs = counts / counts.sum()
+        self._weights = self.sif_a / (self.sif_a + probs)
+        self._oov_sif = self.sif_a / (self.sif_a + 1.0 / counts.sum())  # 未知語は「ごく稀」扱い
+        self._build_subword_table(counts)
+        self._fit_sentence_component(sequences)
+        self.ready = True
+        logger.info(
+            "意味空間を構築しました。発言 %d / 語彙 %d / %d次元 / サブワード %d (%.2f秒)",
+            len(texts), size, emb.shape[1], len(self._ngram_ids), time.perf_counter() - started,
+        )
+
+    def _count_cooccurrence(self, sequences: list[list[str]], vocab: dict[str, int]) -> Counter:
+        """共起: 同じ発言内 (距離で重み付け) と、直前の発言との間 (弱く)"""
         cooc: Counter = Counter()
         prev: list[int] = []
         for seq in sequences:
@@ -756,67 +626,109 @@ class SemanticSpace:
                             cooc[(p, c)] += self.turn_weight
                             cooc[(c, p)] += self.turn_weight
             prev = current
-        if not cooc:
-            return
+        return cooc
 
-        size = len(words)
-        keys = np.array(list(cooc.keys()), dtype=np.int64)
-        values = np.array(list(cooc.values()), dtype=np.float64)
-        matrix = coo_matrix((values, (keys[:, 0], keys[:, 1])), shape=(size, size)).tocsr()
-
-        # PPMI (文脈語の確率を cds 乗で平滑化)
-        total = matrix.sum()
-        row_sum = np.asarray(matrix.sum(axis=1)).ravel()
-        smoothed = row_sum ** self.cds
-        context_prob = smoothed / smoothed.sum()
-        coo = matrix.tocoo()
-        with np.errstate(divide="ignore", invalid="ignore"):
-            pmi = np.log((coo.data / total) / ((row_sum[coo.row] / total) * context_prob[coo.col]))
-        pmi = np.where(np.isfinite(pmi), np.maximum(pmi, 0.0), 0.0)
-        ppmi = coo_matrix((pmi, (coo.row, coo.col)), shape=(size, size)).tocsr()
-        ppmi.eliminate_zeros()
-
-        # SVD で圧縮
-        k = min(self.dim, size - 1)
-        if k < 2 or ppmi.nnz == 0:
-            return
-        try:
-            u, s, _ = svds(ppmi, k=k, random_state=0)
-        except Exception:  # ARPACKが収束しないとき。小さければ素直に全部分解する
-            if size > 4000:
-                logger.exception("SVDに失敗しました")
-                return
-            u, s, _ = np.linalg.svd(ppmi.toarray(), full_matrices=False)
-            u, s = u[:, :k], s[:k]
-        emb = u * np.sqrt(np.maximum(s, 0.0))
-
-        # 平均と第1主成分を引く (どの語にも似てしまう成分) → 単位長に揃える
+    def _postprocess(self, emb):
+        """平均と上位主成分を引く (どの語にも似てしまう成分) → 単位長に揃える"""
         emb = emb - emb.mean(axis=0, keepdims=True)
-        if emb.shape[0] > 2:
-            _, _, vt = np.linalg.svd(emb, full_matrices=False)
-            emb = emb - np.outer(emb @ vt[0], vt[0])
+        r = min(self.remove_components, emb.shape[1] - 1)
+        if r > 0 and emb.shape[0] > 2:
+            _, vecs = np.linalg.eigh(emb.T @ emb)  # 昇順なので末尾が最大の主成分
+            top = vecs[:, -r:]
+            emb = emb - (emb @ top) @ top.T
         norms = np.linalg.norm(emb, axis=1, keepdims=True)
-        emb = np.where(norms > 1e-12, emb / np.maximum(norms, 1e-12), 0.0)
+        return np.where(norms > 1e-12, emb / np.maximum(norms, 1e-12), 0.0)
 
-        counts = np.array([word_counts[w] for w in words], dtype=np.float64)
-        self.words = words
-        self.vocab = vocab
-        self.embeddings = emb
-        self.counts = counts
-        self.doc_freq = np.array([doc_freq[w] for w in words], dtype=np.float64)
-        self.doc_total = len(sequences)
-        self._lengths = np.array([len(w) for w in words])
-        probs = counts / counts.sum()
-        self._weights = self.sif_a / (self.sif_a + probs)
-        self.ready = True
-        logger.info(
-            "密ベクトル空間を構築しました。発言 %d / 語彙 %d / %d次元 (%.2f秒)",
-            len(texts), size, emb.shape[1], time.perf_counter() - started,
-        )
+    # ------------------------------------------------------------------
+    # サブワード補完 (未知語対策)
+    # ------------------------------------------------------------------
+    def _subwords(self, token: str) -> list[str]:
+        """語を構成する文字n-gram。漢字1文字の語はその文字自身。"""
+        if len(token) == 1:
+            return [token] if "一" <= token <= "鿿" else []
+        grams: list[str] = []
+        for n in self.sub_ngrams:
+            if n <= len(token):
+                grams.extend(token[i : i + n] for i in range(len(token) - n + 1))
+        return grams
+
+    def _build_subword_table(self, counts) -> None:
+        """各n-gramの「そのn-gramを含む語の平均ベクトル」を作る。
+
+        どの語にも入っている汎用n-gram (「して」「ない」など) は df が多いので捨てる。
+        残ったn-gramは、珍しいほど (df が小さいほど) 大きな重みで未知語の合成に使う。
+        """
+        self._ngram_ids, self._ngram_emb, self._ngram_idf = {}, None, None
+        containing: dict[str, list[int]] = {}
+        for word, i in self.vocab.items():
+            for gram in set(self._subwords(word)):
+                containing.setdefault(gram, []).append(i)
+        size = len(self.words)
+        max_df = max(10, int(self.sub_max_df_ratio * size))
+        grams: list[str] = []
+        rows: list[int] = []
+        cols: list[int] = []
+        vals: list[float] = []
+        dfs: list[int] = []
+        for gram, ids in containing.items():
+            if len(ids) > max_df:
+                continue
+            row = len(grams)
+            grams.append(gram)
+            dfs.append(len(ids))
+            weights = [math.sqrt(counts[i]) for i in ids]
+            total = sum(weights)
+            for i, w in zip(ids, weights):
+                rows.append(row)
+                cols.append(i)
+                vals.append(w / total)
+        if not grams:
+            return
+        proj = coo_matrix((vals, (rows, cols)), shape=(len(grams), size)).tocsr()
+        gram_emb = np.asarray(proj @ self.embeddings)
+        norms = np.linalg.norm(gram_emb, axis=1, keepdims=True)
+        self._ngram_emb = np.where(norms > 1e-12, gram_emb / np.maximum(norms, 1e-12), 0.0).astype(np.float32)
+        self._ngram_idf = np.log(1.0 + size / np.array(dfs, dtype=np.float64)).astype(np.float32)
+        self._ngram_ids = {g: i for i, g in enumerate(grams)}
+
+    def _backoff_vector(self, token: str):
+        """語彙に無い語を、含まれるn-gramのベクトルから合成する。手がかりが無ければ None。"""
+        if self._ngram_emb is None:
+            return None
+        ids = [self._ngram_ids[g] for g in self._subwords(token) if g in self._ngram_ids]
+        if not ids:
+            return None
+        vec = (self._ngram_idf[ids, None] * self._ngram_emb[ids]).sum(axis=0)
+        norm = float(np.linalg.norm(vec))
+        return vec / norm if norm > 1e-12 else None
 
     # ------------------------------------------------------------------
     # 単語
     # ------------------------------------------------------------------
+    def word_vector(self, token: str, *, subword: bool = True):
+        """語のベクトル (単位長)。語彙に無ければ、分割した断片の平均 → (subword=True なら) n-gram合成。"""
+        if not self.ready:
+            return None
+        i = self.vocab.get(token)
+        if i is not None:
+            return self.embeddings[i]
+        pieces = [self.vocab[t] for t in self._tokens(token) if t in self.vocab]
+        if pieces:
+            vec = self.embeddings[pieces].mean(axis=0)
+            norm = float(np.linalg.norm(vec))
+            if norm > 1e-12:
+                return vec / norm
+        return self._backoff_vector(token) if subword else None
+
+    def similarity(self, word1: str, word2: str, *, subword: bool = False) -> float:
+        """2語のコサイン類似度。既定では未知語のn-gram合成は使わない (置換の誤爆を避ける)。"""
+        v1, v2 = self.word_vector(word1, subword=subword), self.word_vector(word2, subword=subword)
+        if v1 is None or v2 is None:
+            return 0.0
+        return float(v1 @ v2)
+
+    calculate_similarity = similarity  # ContextualWordReplacer 向けの互換名
+
     def _candidate_mask(self, min_count: int, max_doc_ratio: float, min_chars: int):
         mask = self.counts >= min_count
         if self.doc_total:
@@ -824,12 +736,6 @@ class SemanticSpace:
         if min_chars > 1:
             mask &= self._lengths >= min_chars
         return mask
-
-    def similarity(self, word1: str, word2: str) -> float:
-        i, j = self.vocab.get(word1), self.vocab.get(word2)
-        if not self.ready or i is None or j is None:
-            return 0.0
-        return float(self.embeddings[i] @ self.embeddings[j])
 
     def arithmetic(
         self,
@@ -841,26 +747,25 @@ class SemanticSpace:
         max_doc_ratio: float = 0.2,
         min_chars: int = 2,
         min_sim: float = 0.0,
+        **_legacy,
     ) -> list[tuple[str, float]]:
-        """単語の演算 (例: 王様 - 男 + 女)。入力語を含む/入力語に含まれる語は除く。"""
+        """単語の演算 (例: 王様 - 男 + 女)。入力語を含む/入力語に含まれる語は除く。
+
+        入力語が語彙に無くても、サブワード補完で近似ベクトルが作れれば計算する。
+        """
         positive = list(positive or [])
         negative = list(negative or [])
         if not self.ready or not (positive or negative):
             return []
         inputs = set(positive) | set(negative)
-        for word in inputs:
-            if word not in self.vocab:
-                logger.warning(
-                    "単語 '%s' はまだ記憶(学習データ)に存在しません。(出現が%d回未満の語も含みます)",
-                    word, self.min_count,
-                )
-                return []
-
         target = np.zeros(self.embeddings.shape[1])
-        for word in positive:
-            target += self.embeddings[self.vocab[word]]
-        for word in negative:
-            target -= self.embeddings[self.vocab[word]]
+        for sign, group in ((1.0, positive), (-1.0, negative)):
+            for word in group:
+                vec = self.word_vector(word, subword=True)
+                if vec is None:
+                    logger.warning("単語 '%s' はまだ記憶(学習データ)に存在せず、近似もできません。", word)
+                    return []
+                target += sign * vec
         norm = np.linalg.norm(target)
         if norm < 1e-12:
             return []
@@ -868,7 +773,9 @@ class SemanticSpace:
         scores = self.embeddings @ (target / norm)
         mask = self._candidate_mask(min_count, max_doc_ratio, min_chars)
         for word in inputs:
-            mask[self.vocab[word]] = False
+            i = self.vocab.get(word)
+            if i is not None:
+                mask[i] = False
         for i in np.flatnonzero(mask):
             candidate = self.words[i]
             if any(inp in candidate or candidate in inp for inp in inputs):
@@ -887,37 +794,152 @@ class SemanticSpace:
     # ------------------------------------------------------------------
     # 文
     # ------------------------------------------------------------------
-    def query_words(self, text: str, max_doc_ratio: float = 0.1) -> list[str]:
-        """文に含まれる、語彙にある内容語 (どこにでも出る語は除く) を出現順に返す"""
+    def _encode(self, token_lists: list[list[str]], remove_pc: bool = True):
+        """語リストの束を文ベクトル (行ごとに単位長、語が無い行は零) にする。
+
+        語ベクトルのSIF重み付き和。未知語はサブワード補完のベクトルを oov_weight 倍して足す。
+        """
+        n, dim, size = len(token_lists), self.embeddings.shape[1], len(self.words)
+        out = np.zeros((n, dim), dtype=np.float32)
+        rows: list[int] = []
+        cols: list[int] = []
+        vals: list[float] = []
+        oov_scale = self.oov_weight * self._oov_sif
+        for r, tokens in enumerate(token_lists):
+            for token in tokens:
+                i = self.vocab.get(token)
+                if i is not None:
+                    rows.append(r)
+                    cols.append(i)
+                    vals.append(self._weights[i])
+                elif oov_scale > 0:
+                    vec = self._backoff_vector(token)
+                    if vec is not None:
+                        out[r] += oov_scale * vec
+        if rows:
+            weights = coo_matrix((vals, (rows, cols)), shape=(n, size)).tocsr()
+            out += np.asarray(weights @ self.embeddings, dtype=np.float32)
+
+        def unit(mat):
+            norms = np.linalg.norm(mat, axis=1, keepdims=True)
+            return np.where(norms > 1e-6, mat / np.maximum(norms, 1e-6), 0.0).astype(np.float32)
+
+        out = unit(out)
+        if remove_pc and self._sent_pc is not None:
+            out = unit(out - np.outer(out @ self._sent_pc, self._sent_pc))
+        return out
+
+    def _fit_sentence_component(self, sequences: list[list[str]]) -> None:
+        """全発言の文ベクトルに共通する第1主成分を求める (話題に関係なく似てしまう成分)"""
+        self._sent_pc = None
+        dim = self.embeddings.shape[1]
+        cov = np.zeros((dim, dim))
+        used = 0
+        for start in range(0, len(sequences), self._CHUNK):
+            chunk = self._encode(sequences[start : start + self._CHUNK], remove_pc=False)
+            chunk = chunk[np.linalg.norm(chunk, axis=1) > 0]
+            cov += chunk.T.astype(np.float64) @ chunk
+            used += len(chunk)
+        if used < 3:
+            return
+        _, vecs = np.linalg.eigh(cov)
+        self._sent_pc = vecs[:, -1].astype(np.float32)
+
+    def embed_texts(self, texts: Sequence[str]):
+        """発言のリストを (件数, dim) の行列にする。会話ではない行や語の無い発言は零ベクトル。"""
         if not self.ready:
-            return []
-        found: list[str] = []
-        for token in self._tokens(text):
-            i = self.vocab.get(token)
-            if i is None or token in found:
-                continue
-            if self.doc_total and self.doc_freq[i] > max_doc_ratio * self.doc_total:
-                continue
-            found.append(token)
-        return found
+            return None
+        parts = []
+        for start in range(0, len(texts), self._CHUNK):
+            batch = texts[start : start + self._CHUNK]
+            token_lists = [self._tokens(t) if self._usable_text(t) else [] for t in batch]
+            parts.append(self._encode(token_lists))
+        if not parts:
+            return np.zeros((0, self.embeddings.shape[1]), dtype=np.float32)
+        return parts[0] if len(parts) == 1 else np.vstack(parts)
 
     def embed_text(self, text: str):
-        """文を、語ベクトルの重み付き平均 (単位長) にする。語彙の語が1つも無ければ None。"""
+        """1文の意味ベクトル (単位長)。語が1つも拾えなければ None。"""
         if not self.ready:
             return None
         if text in self._sentence_cache:
             return self._sentence_cache[text]
-        ids = [self.vocab[t] for t in self._tokens(text) if t in self.vocab]
-        vector = None
-        if ids:
-            total = (self._weights[ids, None] * self.embeddings[ids]).sum(axis=0)
-            norm = np.linalg.norm(total)
-            if norm > 1e-12:
-                vector = total / norm
+        vec = self.embed_texts([text])[0]
+        result = vec if float(np.linalg.norm(vec)) > 0 else None
         if len(self._sentence_cache) >= 50_000:
             self._sentence_cache.clear()
-        self._sentence_cache[text] = vector
-        return vector
+        self._sentence_cache[text] = result
+        return result
+
+
+# ---------------------------------------------------------------------------
+# 密ベクトル索引 (記憶の全発言の意味ベクトル)
+# ---------------------------------------------------------------------------
+class DenseIndex:
+    """記憶の各発言を意味ベクトルにして行列で持つ。TfidfIndex と同じく増分更新に対応する。
+
+    - 末尾への追加は新しい分だけ計算して足す (容量は倍々に確保するのでコピーが少ない)
+    - 先頭削除・途中挿入は invalidate() で全再構築を予約する
+    - 意味空間が学習し直されたら (version が変わったら) 自動で全再構築する
+    """
+
+    def __init__(self):
+        self._buf = None
+        self.size = 0
+        self.version = -1
+        self._stale = True
+
+    def invalidate(self):
+        self._stale = True
+
+    @property
+    def matrix(self):
+        return None if self._buf is None else self._buf[: self.size]
+
+    def sync(self, entries: Sequence, space: SemanticSpace):
+        if np is None or not space.ready:
+            self._buf, self.size, self.version, self._stale = None, 0, -1, True
+            return
+        n = len(entries)
+        usable = not self._stale and self.version == space.version and self._buf is not None
+        if usable and n == self.size:
+            return
+        if usable and n > self.size:
+            self._append(space.embed_texts([_entry_text(e) for e in entries[self.size :]]))
+            return
+        self._buf = np.array(space.embed_texts([_entry_text(e) for e in entries]), dtype=np.float32)
+        self.size = n
+        self.version = space.version
+        self._stale = False
+
+    def _append(self, new):
+        need = self.size + len(new)
+        if need > len(self._buf):
+            grown = np.zeros((max(need, int(len(self._buf) * 1.5) + 16), self._buf.shape[1]), dtype=np.float32)
+            grown[: self.size] = self._buf[: self.size]
+            self._buf = grown
+        self._buf[self.size : need] = new
+        self.size = need
+
+    def similarities(self, indices: Sequence[int], query) -> list[float]:
+        """指定した発言たちと query の意味の近さ (負は0に切る)"""
+        matrix = self.matrix
+        if matrix is None or query is None or not len(indices):
+            return [0.0] * len(indices)
+        valid = [i if 0 <= i < self.size else 0 for i in indices]
+        sims = matrix[valid] @ query
+        return [max(0.0, float(s)) if 0 <= i < self.size else 0.0 for s, i in zip(sims, indices)]
+
+    def search(self, query, top_k: int, min_sim: float) -> list[tuple[float, int]]:
+        """query に意味が近い発言を (類似度, idx) の降順で返す"""
+        matrix = self.matrix
+        if matrix is None or query is None or self.size == 0 or top_k <= 0:
+            return []
+        sims = matrix @ query
+        k = min(top_k, len(sims))
+        top = np.argpartition(-sims, k - 1)[:k] if k < len(sims) else np.arange(len(sims))
+        top = top[np.argsort(-sims[top])]
+        return [(float(sims[i]), int(i)) for i in top if sims[i] >= min_sim]
 
 
 # ---------------------------------------------------------------------------
@@ -1051,6 +1073,7 @@ class ContextualWordReplacer:
 
     MIN_ANCHOR_CHARS = 2  # 差分の前後で、これ以上続く共通部分だけを「変わっていない部分」とみなす
     RULE_CACHE_SIZE = 4096
+    FORCED_SPLIT_MIN_CONTEXT = 2  # 強制切り出しトークンで置換するとき、最低限そろっていてほしい周辺トークン数
 
     @staticmethod
     def _is_ideograph(text: str) -> bool:
@@ -1060,6 +1083,10 @@ class ContextualWordReplacer:
     def _is_usable_rule(self, old_tokens: list[str], new_tokens: list[str]) -> bool:
         old_text, new_text = "".join(old_tokens), "".join(new_tokens)
         if not new_text or old_text == new_text:
+            return False
+        # 1文字トークンが2つ以上並んだだけの断片は、トークナイザが「まとまり」と認めていない文字列の切れ端。
+        # (チャンネルIDの数字 "5","6" → "0","8" のように、桁の差が語の置換ルールになってしまう)
+        if len(old_tokens) >= 2 and all(len(token) == 1 for token in old_tokens):
             return False
         if len(old_text) < self.MIN_RULE_CHARS and not self._is_ideograph(old_text):
             return False
@@ -1102,7 +1129,7 @@ class ContextualWordReplacer:
 
     def extract_token_replacements(self, before_tokens: list[str], after_tokens: list[str]) -> list[dict]:
         """置換ルールを抽出する。履歴はほぼ毎回同じ内容なので結果を使い回す。"""
-        key = (tuple(before_tokens), tuple(after_tokens))
+        key = (tuple(before_tokens), tuple(after_tokens), len(self.protected_words))  # 名前が増えたら作り直す
         rules = self._rule_cache.get(key)
         if rules is None:
             if len(self._rule_cache) >= self.RULE_CACHE_SIZE:
@@ -1134,7 +1161,10 @@ class ContextualWordReplacer:
 
                 for old_core, new_core, whole in self._core_pairs("".join(old_tokens), "".join(new_tokens)):
                     # 全体が入れ替わっているなら元のトークン列のまま、一部なら芯だけを1語として扱う
-                    rule_old, rule_new = (old_tokens, new_tokens) if whole else ([old_core], [new_core])
+                    # 名前 (登録語) の入れ替えは、文字単位の差分で切らず必ず丸ごと1語として扱う
+                    # (「小関琉聖だった人」→「小関琉聖」が「だった人」の削除になって捨てられるのを防ぐ)
+                    named = "".join(old_tokens) in self.protected_words or "".join(new_tokens) in self.protected_words
+                    rule_old, rule_new = (old_tokens, new_tokens) if (whole or named) else ([old_core], [new_core])
                     if not self._is_usable_rule(rule_old, rule_new):
                         continue
                     replacements.append({
@@ -1145,7 +1175,9 @@ class ContextualWordReplacer:
                     })
         return replacements
 
-    def _match_context_and_semantics(self, tokens: list[str], idx: int, rep: dict) -> bool:
+    def _match_context_and_semantics(
+        self, tokens: list[str], idx: int, rep: dict, natural: set[str] | None = None
+    ) -> bool:
         """単語の類似度だけでなく、『前後12トークンの広域文脈』が一致するかを検証する"""
         old_tokens = rep["old"]
         if idx + len(old_tokens) > len(tokens):
@@ -1177,19 +1209,58 @@ class ContextualWordReplacer:
         if right_start + WINDOW_SIZE > len(tokens):
             actual_right = actual_right + ["<EOS>"] * (right_start + WINDOW_SIZE - len(tokens))
             
-        # 左右それぞれ12トークンが「完全一致」している数をカウント
-        left_matches = sum(1 for a, b in zip(actual_left, rep["left"]) if a == b)
-        right_matches = sum(1 for a, b in zip(actual_right, rep["right"]) if a == b)
-        
-        # 通常の単語（文字列）の場合：
-        # 24トークン中、左右合わせて最低でも6トークン以上の文脈一致を求める（環境の安全性を担保）
-        if (left_matches + right_matches) < 6 and not is_exact_match:
+        # パディング (<BOS>/<EOS>) 同士の一致は「文脈が一致した」証拠にならないので数えない
+        pads = ("<BOS>", "<EOS>")
+        rule_has_context = any(tok not in pads for tok in rep["left"] + rep["right"])
+        actual_has_context = any(tok not in pads for tok in actual_left + actual_right)
+        # 文全体が入れ替わった履歴から作ったルール (文脈が全部パディング) は、文全体にだけ適用する
+        # (でないと「った→ぃ」のようなルールが、あらゆる文の一部を壊す)
+        # ただし話者名・自分の名前 (登録語) は、どの文の中でも置換する
+        is_name_rule = any(tok in self.protected_words for tok in old_tokens)
+        if not rule_has_context and actual_has_context and not is_name_rule:
             return False
-                
+
+        left_matches = sum(1 for a, b in zip(actual_left, rep["left"]) if a == b and a not in pads)
+        right_matches = sum(1 for a, b in zip(actual_right, rep["right"]) if a == b and a not in pads)
+        context_matches = left_matches + right_matches
+
+        # 完全一致でも、extra_words で語の途中から強制的に切り出したトークンは偶然の一致かもしれない
+        # (「まったく」の「った」など)。その場合は、周りの文脈も一部一致していることを求める。
+        # 話者名などの登録語は自然に1トークンになるので、この条件の対象にならない。
+        forced_split = (
+            is_exact_match
+            and natural is not None
+            and any(tok not in natural for tok in tokens[idx : idx + len(old_tokens)])
+        )
+        if forced_split and rule_has_context and context_matches < self.FORCED_SPLIT_MIN_CONTEXT:
+            return False
+        if forced_split and not rule_has_context:
+            return False
+
+        # 通常の単語 (あいまい一致) の場合：
+        # 24トークン中、左右合わせて最低でも6トークン以上の文脈一致を求める（環境の安全性を担保）
+        if context_matches < 6 and not is_exact_match:
+            return False
+
         return True
 
-    def execute_replace(self, text: str, after_list: list[str], before_list: list[str], tokenizer_func) -> str:
-        """文脈付き置換を実行する"""
+    def execute_replace(
+        self,
+        text: str,
+        after_list: list[str],
+        before_list: list[str],
+        tokenizer_func,
+        *,
+        self_names: Iterable[str] = (),
+        base_speaker: str | None = None,
+    ) -> str:
+        """文脈付き置換を実行する
+
+        self_names / base_speaker を渡すと、「誰かの名前 → 自分の名前」のルールは
+        その人自身の発言 (base_speaker) にだけ適用する。これは「自分の発言の中の自分の名前」を
+        直すためのルールなので、別の人の発言の中でその名前が出てきても (呼びかけ・他人の話) 自分の名前には直さない。
+        base_speaker が None なら制限しない。
+        """
         # すべての置換履歴からトークンベースのルールを構築
         all_rules = []
         for after, before in zip(after_list, before_list):
@@ -1199,6 +1270,17 @@ class ContextualWordReplacer:
             a_tokens = tokenizer_func(after, drop_threshold=0.4)
             all_rules.extend(self.extract_token_replacements(b_tokens, a_tokens))
             
+        if base_speaker is not None:
+            mine = set(self_names)
+            all_rules = [
+                r for r in all_rules
+                if not (
+                    "".join(r["new"]) in mine
+                    and "".join(r["old"]) in self.protected_words
+                    and "".join(r["old"]) != base_speaker
+                )
+            ]
+
         # 最新の履歴を優先
         all_rules.reverse()
         
@@ -1206,11 +1288,12 @@ class ContextualWordReplacer:
         # 単独のトークンとして切り出す (でないとルールと照合できない)
         targets = {rule["old"][0] for rule in all_rules if len(rule["old"]) == 1}
         tokens = tokenizer_func(text, drop_threshold=0.4, extra_words=targets)
+        natural = set(tokenizer_func(text, drop_threshold=0.4)) if targets else None  # 強制切り出し無しの自然な分割
         i = 0
         while i < len(tokens):
             replaced = False
             for rule in all_rules:
-                if self._match_context_and_semantics(tokens, i, rule):
+                if self._match_context_and_semantics(tokens, i, rule, natural):
                     logger.info(f"文脈置換適用: {tokens[i:i+len(rule['old'])]} -> {rule['new']} (文脈: {rule['left']}_{rule['right']})")
                     # トークンリストを書き換え
                     tokens[i:i+len(rule['old'])] = rule['new']
@@ -1276,8 +1359,9 @@ class Himawaria:
         self.latest_log: list = [["init", "init"]]
 
         self.tokenizer = NgramTokenizer()
-        self.semantic_learner = SelfSemanticLearner(window_size=12)
+        self.semantic_learner = SemanticSpace()  # 名前は互換のため据え置き
         self.index = TfidfIndex()
+        self.dense = DenseIndex()
         self.contextual_word_replacer = ContextualWordReplacer(
             semantic_learner=self.semantic_learner,
             protected_words=self.tokenizer.forced_words,
@@ -1411,7 +1495,7 @@ class Himawaria:
             del sentences[:overflow]
             self.heart = max(0, self.heart - overflow)
             self.pre_heart = max(0, self.pre_heart - overflow)
-            self.index.invalidate()
+            self._invalidate_indexes()
 
         self._unsaved += 1
         if save and self._unsaved >= self.autosave_every:
@@ -1440,10 +1524,17 @@ class Himawaria:
         """TF-IDF索引と意味ベクトルを強制的に全再構築する"""
         self.index.rebuild(self.memory["sentence"])
         self._ensure_semantic(force=True)
+        self.dense.sync(self.memory["sentence"], self.semantic_learner)
+
+    def _invalidate_indexes(self):
+        """先頭削除・途中挿入でidxがずれたとき、両方の索引の全再構築を予約する"""
+        self.index.invalidate()
+        self.dense.invalidate()
 
     def _ensure_index(self):
         self.index.sync(self.memory["sentence"])
         self._ensure_semantic()
+        self.dense.sync(self.memory["sentence"], self.semantic_learner)
 
     def _ensure_semantic(self, force: bool = False):
         """意味ベクトルは重いので、記憶が一定量増減したときだけ再学習する"""
@@ -1518,37 +1609,32 @@ class Himawaria:
             str(self.last_bot_base or ""),
         )
 
-    def _expansion_tokens(self, x: str) -> list[str]:
-        """入力語と意味が近い語の文字n-gram。文字が一致しなくても候補に拾うための手がかり。"""
-        cfg = self.config
-        space = self.semantic_learner.space
-        if not cfg.semantic_expand_neighbors or not space.ready:
-            return []
-        tokens: list[str] = []
-        for word in space.query_words(x):
-            for neighbor, _ in space.most_similar(
-                word, cfg.semantic_expand_neighbors, min_sim=cfg.semantic_expand_min_sim
-            ):
-                tokens.extend(tokenize_ngrams(neighbor))
-        return list(dict.fromkeys(tokens))
-
-    def _semantic_score(self, text: str, query_vector) -> float:
-        """入力文と text の意味の近さ (0〜1)。語彙に無い語ばかりなら0。"""
-        if query_vector is None:
-            return 0.0
-        vector = self.semantic_learner.space.embed_text(text)
-        if vector is None:
-            return 0.0
-        return max(0.0, float(query_vector @ vector))
-
     def _collect_candidates(
-        self, query_tokens: list[str], expansion_tokens: Sequence[str] = ()
+        self, query_tokens: list[str], query_semantic=None
     ) -> list[tuple[float, int]]:
-        """転置索引で絞り込み、(TF-IDFスコア, idx) の候補を返す。
+        """(text スコア, idx) の候補を返す。文字の一致 (TF-IDF) と意味の近さ (密ベクトル) の2経路。
 
-        expansion_tokens (意味が近い語のn-gram) があれば、文字の一致だけでは拾えない候補も
-        少数だけ追加する。その候補のスコアは semantic_expand_weight 倍に抑える。
+        1. TF-IDF : 転置索引で絞り込み、コサイン類似度で採点する
+        2. 意味検索: 入力文の意味ベクトルに近い発言を行列積で探す。文字がほとんど一致しなくても拾える。
+                     TF-IDF側で拾えなかった分だけを少数追加し、スコアは dense_candidate_weight 倍に抑える
         """
+        cfg = self.config
+        candidates = self._lexical_candidates(query_tokens)
+
+        if query_semantic is not None and cfg.dense_candidates > 0:
+            seen = {idx for _, idx in candidates}
+            added = 0
+            for sim, idx in self.dense.search(query_semantic, cfg.dense_candidates * 4, cfg.dense_min_sim):
+                if idx in seen or not self._is_valid_pair(idx):
+                    continue
+                candidates.append((cfg.dense_candidate_weight * sim, idx))
+                added += 1
+                if added >= cfg.dense_candidates:
+                    break
+        return candidates
+
+    def _lexical_candidates(self, query_tokens: list[str]) -> list[tuple[float, int]]:
+        """転置索引で絞り込み、(TF-IDFスコア, idx) の候補を返す。"""
         cfg = self.config
         query_set = set(query_tokens)
         query_vector = self.index.query_vector(query_tokens)
@@ -1581,27 +1667,6 @@ class Himawaria:
                 candidates.append((score, idx))
                 if 0 < limit <= len(candidates):
                     break
-
-        if expansion_tokens:
-            seen = {idx for _, idx in candidates}
-            expansion_set = set(expansion_tokens)
-            expansion_vector = self.index.query_vector(list(expansion_set))
-            min_expansion_matches = min(cfg.min_query_matches, len(expansion_set))
-            extra: list[tuple[float, int]] = []
-            for idx, match_count in self.index.match_counts(expansion_set).items():
-                if idx in seen or match_count < min_expansion_matches:
-                    continue
-                score = cfg.semantic_expand_weight * self.index.cosine(expansion_vector, idx)
-                if score > cfg.min_tfidf_candidate_score:
-                    extra.append((score, idx))
-            extra.sort(reverse=True)
-            added = 0
-            for score, idx in extra:
-                if self._is_valid_pair(idx):
-                    candidates.append((score, idx))
-                    added += 1
-                    if added >= cfg.semantic_expand_limit:
-                        break
         return candidates
 
     def _recent_user_utterances(self, x: str, u: str) -> list[str]:
@@ -1648,7 +1713,7 @@ class Himawaria:
         return score
 
     def _score_candidates(
-        self, candidates: list[tuple[float, int]], x: str, u: str
+        self, candidates: list[tuple[float, int]], x: str, u: str, query_semantic=None
     ) -> list[_Candidate]:
         cfg = self.config
 
@@ -1661,10 +1726,12 @@ class Himawaria:
         style_vector: dict[str, float] = {}
         if cfg.chara_style_weight and self.chara_style:
             style_vector = self.index.query_vector(tokenize_ngrams(self.chara_style))
-        query_semantic = None
-        if cfg.semantic_score_weight:
-            query_semantic = self.semantic_learner.space.embed_text(x)
-        sentences = self.memory["sentence"]
+        # 候補すべての「入力との意味の近さ」を、密索引の行列積でまとめて求める
+        semantics = (
+            self.dense.similarities([idx for _, idx in candidates], query_semantic)
+            if cfg.semantic_score_weight and query_semantic is not None
+            else [0.0] * len(candidates)
+        )
 
         items = [
             _Candidate(
@@ -1674,9 +1741,9 @@ class Himawaria:
                 context=self._context_score(idx) if cfg.context_score_weight else 0.0,
                 history=self._history_score(idx, history_vectors),
                 style=self.index.cosine(style_vector, idx + 1) if style_vector else 0.0,
-                semantic=self._semantic_score(sentences[idx][0], query_semantic),
+                semantic=semantics[n],
             )
-            for text_score, idx in candidates
+            for n, (text_score, idx) in enumerate(candidates)
         ]
 
         text_norm = _normalize_scores([it.text for it in items])
@@ -1724,12 +1791,15 @@ class Himawaria:
         if not query_tokens:
             return None
 
-        candidates = self._collect_candidates(query_tokens, self._expansion_tokens(x))
+        query_semantic = None
+        if self.config.semantic_score_weight or self.config.dense_candidates:
+            query_semantic = self.semantic_learner.embed_text(x)
+        candidates = self._collect_candidates(query_tokens, query_semantic)
         if not candidates:
             logger.info("検索候補なし: TF-IDF類似度が閾値以下です (force=%s)", force)
             return None
 
-        best = self._pick_best(self._score_candidates(candidates, x, u), force)
+        best = self._pick_best(self._score_candidates(candidates, x, u, query_semantic), force)
         if best is None:
             return None
 
@@ -1814,6 +1884,17 @@ class Himawaria:
         self.memory["word_replacer_memory_after"] = self.word_replacer_memory_after
         self.memory["word_replacer_memory_before"] = self.word_replacer_memory_before
 
+    def _remember_name_echo(self, result: str, base: str):
+        """返信の結果 (置換後) と元の発言の差を履歴に残す。ただし名前が変わったときだけ。
+
+        置換の結果をそのまま全部記録し直すと、一度でも誤った置換 (「まったく」→「まぃく」など) が
+        起きたとき、それが新しい正規ルールとして学習されて永久に再生産される。
+        名前の入れ替え (会話の間ずっと引き継ぎたいもの) だけを引き継ぐ。
+        """
+        names = self.tokenizer.forced_words
+        if any((name in base) != (name in result) for name in names if name in base or name in result):
+            self._remember_replacement(result, base)
+
     def _remember_self_name(self, author) -> None:
         """返信の元の発言者の名前 → 自分の名前、の置換を履歴に残す。
 
@@ -1825,6 +1906,26 @@ class Himawaria:
             return
         for my_name in reversed(self.my_names):
             self._remember_replacement(my_name, name)
+
+    def forget_replacements(self, *texts: str) -> int:
+        """置換履歴から、指定した文字列を含むペアをすべて消す (汚染された履歴の掃除用)。消した件数を返す。
+
+        例: bot.forget_replacements("まぃく", "ぃ")
+        """
+        pairs = [
+            (a, b)
+            for a, b in zip(self.word_replacer_memory_after, self.word_replacer_memory_before)
+            if not any(text and (text in a or text in b) for text in texts)
+        ]
+        removed = len(self.word_replacer_memory_after) - len(pairs)
+        self.word_replacer_memory_after = [a for a, _ in pairs]
+        self.word_replacer_memory_before = [b for _, b in pairs]
+        self.memory["word_replacer_memory_after"] = self.word_replacer_memory_after
+        self.memory["word_replacer_memory_before"] = self.word_replacer_memory_before
+        self.contextual_word_replacer._rule_cache.clear()
+        self._unsaved += 1
+        self.save_data()
+        return removed
 
     def _truncate_replacer_memory(self):
         """置換履歴のサイズ制御"""
@@ -1877,7 +1978,7 @@ class Himawaria:
         pos = self.heart + 1
         if pos < len(sentences) and sentences[pos][0] != x:
             sentences.insert(pos, [x, "!system"])
-            self.index.invalidate()  # 途中挿入でidxがずれるため全再構築
+            self._invalidate_indexes()  # 途中挿入でidxがずれるため全再構築
 
     def speak_freely(self, is_active_learning: bool = True) -> str | None:
         result = self.current_voice
@@ -1885,7 +1986,7 @@ class Himawaria:
         if result is None:
             return None
 
-        self._remember_replacement(result, self.last_bot_base)
+        self._remember_name_echo(result, self.last_bot_base)
         self._remember_self_name(self.last_bot_base_user)
         self._truncate_replacer_memory()
 
@@ -1906,9 +2007,10 @@ class Himawaria:
         self._mark_bot_turn()
 
         result = self.contextual_word_replacer.execute_replace(
-            base_text, self.word_replacer_memory_after, self.word_replacer_memory_before, self.tokenizer.tokenize
+            base_text, self.word_replacer_memory_after, self.word_replacer_memory_before, self.tokenizer.tokenize,
+            self_names=self.my_names, base_speaker=self._person_name(base_user) or "",
         )
-        self._remember_replacement(result, base_text)
+        self._remember_name_echo(result, base_text)
         self._remember_self_name(base_user)
         self._truncate_replacer_memory()
 
@@ -1953,7 +2055,8 @@ class Himawaria:
         self._truncate_replacer_memory()
 
         result = self.contextual_word_replacer.execute_replace(
-            result, self.word_replacer_memory_after, self.word_replacer_memory_before, self.tokenizer.tokenize
+            result, self.word_replacer_memory_after, self.word_replacer_memory_before, self.tokenizer.tokenize,
+            self_names=self.my_names, base_speaker=self._person_name(self.last_bot_base_user) or "",
         )
         result = result.replace("[YOU]", self.last_user)
 
