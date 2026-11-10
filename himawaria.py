@@ -118,8 +118,8 @@ class SearchConfig:
     max_scored_candidates: int = 300  # TF-IDF上位だけを詳細採点する (0以下で無制限)
     semantic_score_weight: float = 0.25  # 入力と候補の「意味の近さ」(文ベクトルのコサイン) の重み。0で無効
     dense_candidates: int = 50  # 意味ベクトルの近さだけで拾う候補の上限。0で無効
-    dense_min_sim: float = 0.55  # 意味検索の候補に入れる最低コサイン類似度
-    dense_candidate_weight: float = 0.5  # 意味だけで拾った候補の text スコア係数 (文字の一致より控えめに)
+    dense_min_sim: float = 0.55  # 意味検索で候補に入れる最低コサイン。返信してよいかの意味側の合格ラインも兼ねる
+    semantic_score_floor: float = 0.3  # 意味スコアの下限。これ以下のコサインは加点0、1.0で満点 (候補間の相対ではなく絶対尺度)
 
 
 # ---------------------------------------------------------------------------
@@ -1062,18 +1062,33 @@ class ContextualWordReplacer:
     MAX_RULE_CHARS = 16
     MAX_RULE_TOKENS = 4
 
-    def __init__(self, semantic_learner, char_sim=0.85, sem_sim=0.75, protected_words=None):
+    def __init__(self, semantic_learner, char_sim=0.85, sem_sim=0.75, protected_words=None, commonness_func=None):
         self.semantic_learner = semantic_learner
         self.char_sim = char_sim
         self.sem_sim = sem_sim
         # 名前など。これらは完全一致のときしか置換しない (「花子」と「次郎」は
         # 文脈が似ているので、意味ベクトルの類似度で曖昧一致させると取り違える)
         self.protected_words = protected_words if protected_words is not None else set()
+        # 文字列 -> 「その文字列を含む発言の割合」(記憶内の出現頻度)。None なら頻度による判断はしない
+        self.commonness_func = commonness_func
         self._rule_cache: dict[tuple, list[dict]] = {}
 
     MIN_ANCHOR_CHARS = 2  # 差分の前後で、これ以上続く共通部分だけを「変わっていない部分」とみなす
     RULE_CACHE_SIZE = 4096
-    FORCED_SPLIT_MIN_CONTEXT = 2  # 強制切り出しトークンで置換するとき、最低限そろっていてほしい周辺トークン数
+    # 語の途中から強制的に切り出したトークンで置換するときの安全策。
+    # 記憶の中でありふれていて、しかも短い文字列 (「った」「ない」など、文法の断片) は、他の語の一部に
+    # 偶然入っているだけのことが多いので、周辺トークンも2つ以上一致しているときだけ置換する。
+    # それ以外 (「Python」「C++」など、長い内容語) は、周辺が違っていても置換してよい
+    # (入力の語を返信に差し替える、という本来の使い方では、周辺は必ず違うため。話題の中心で頻出でも止めない)
+    FORCED_SPLIT_MIN_CONTEXT = 2
+    FORCED_SPLIT_COMMON_RATIO = 0.05  # この割合以上の発言に出る文字列を「ありふれている」とみなす
+    FORCED_SPLIT_SHORT_CHARS = 3  # この文字数以下を「短い」とみなす
+
+    def _is_common(self, text: str) -> bool:
+        """記憶の中でありふれていて短い文字列か。頻度が分からないとき (commonness_func が無い) は False"""
+        if self.commonness_func is None or len(text) > self.FORCED_SPLIT_SHORT_CHARS:
+            return False
+        return self.commonness_func(text) >= self.FORCED_SPLIT_COMMON_RATIO
 
     @staticmethod
     def _is_ideograph(text: str) -> bool:
@@ -1171,7 +1186,10 @@ class ContextualWordReplacer:
                         "old": rule_old,
                         "new": rule_new,
                         "left": left_context,   # 12トークンのリスト
-                        "right": right_context  # 12トークンのリスト
+                        "right": right_context, # 12トークンのリスト
+                        # 発言まるごとの入れ替えか。一部を取り出しただけのルールは、文脈が全部パディングでも
+                        # 「文全体」ではない (「Pythonってどうよ」が1トークンだと、「Python」の前後の文脈が消える)
+                        "whole_sentence": bool(whole or named) and i1 == 0 and i2 == len(before_tokens),
                     })
         return replacements
 
@@ -1211,13 +1229,12 @@ class ContextualWordReplacer:
             
         # パディング (<BOS>/<EOS>) 同士の一致は「文脈が一致した」証拠にならないので数えない
         pads = ("<BOS>", "<EOS>")
-        rule_has_context = any(tok not in pads for tok in rep["left"] + rep["right"])
         actual_has_context = any(tok not in pads for tok in actual_left + actual_right)
         # 文全体が入れ替わった履歴から作ったルール (文脈が全部パディング) は、文全体にだけ適用する
         # (でないと「った→ぃ」のようなルールが、あらゆる文の一部を壊す)
         # ただし話者名・自分の名前 (登録語) は、どの文の中でも置換する
         is_name_rule = any(tok in self.protected_words for tok in old_tokens)
-        if not rule_has_context and actual_has_context and not is_name_rule:
+        if rep.get("whole_sentence") and actual_has_context and not is_name_rule:
             return False
 
         left_matches = sum(1 for a, b in zip(actual_left, rep["left"]) if a == b and a not in pads)
@@ -1232,9 +1249,7 @@ class ContextualWordReplacer:
             and natural is not None
             and any(tok not in natural for tok in tokens[idx : idx + len(old_tokens)])
         )
-        if forced_split and rule_has_context and context_matches < self.FORCED_SPLIT_MIN_CONTEXT:
-            return False
-        if forced_split and not rule_has_context:
+        if forced_split and context_matches < self.FORCED_SPLIT_MIN_CONTEXT and self._is_common("".join(old_tokens)):
             return False
 
         # 通常の単語 (あいまい一致) の場合：
@@ -1365,7 +1380,10 @@ class Himawaria:
         self.contextual_word_replacer = ContextualWordReplacer(
             semantic_learner=self.semantic_learner,
             protected_words=self.tokenizer.forced_words,
+            commonness_func=self._string_doc_ratio,
         )
+        self._commonness_cache: dict[str, float] = {}
+        self._commonness_stamp = 0
         self._semantic_trained_size: int | None = None
         self._unsaved = 0
         self._main_is_valid = False
@@ -1526,6 +1544,23 @@ class Himawaria:
         self._ensure_semantic(force=True)
         self.dense.sync(self.memory["sentence"], self.semantic_learner)
 
+    COMMONNESS_MIN_SENTENCES = 200  # 記憶がこれより少ないと頻度は当てにならないので、ありふれているとは判断しない
+
+    def _string_doc_ratio(self, text: str) -> float:
+        """記憶の発言のうち、text を含むものの割合。結果は記憶が1割増えるまで使い回す。"""
+        sentences = self.memory["sentence"]
+        size = len(sentences)
+        if size < self.COMMONNESS_MIN_SENTENCES:
+            return 0.0
+        if abs(size - self._commonness_stamp) > 0.1 * max(size, 1):
+            self._commonness_cache.clear()
+            self._commonness_stamp = size
+        ratio = self._commonness_cache.get(text)
+        if ratio is None:
+            ratio = sum(1 for entry in sentences if text in _entry_text(entry)) / size
+            self._commonness_cache[text] = ratio
+        return ratio
+
     def _invalidate_indexes(self):
         """先頭削除・途中挿入でidxがずれたとき、両方の索引の全再構築を予約する"""
         self.index.invalidate()
@@ -1612,22 +1647,30 @@ class Himawaria:
     def _collect_candidates(
         self, query_tokens: list[str], query_semantic=None
     ) -> list[tuple[float, int]]:
-        """(text スコア, idx) の候補を返す。文字の一致 (TF-IDF) と意味の近さ (密ベクトル) の2経路。
+        """(TF-IDFスコア, idx) の候補を返す。文字の一致 (TF-IDF) と意味の近さ (密ベクトル) の2経路。
 
         1. TF-IDF : 転置索引で絞り込み、コサイン類似度で採点する
         2. 意味検索: 入力文の意味ベクトルに近い発言を行列積で探す。文字がほとんど一致しなくても拾える。
-                     TF-IDF側で拾えなかった分だけを少数追加し、スコアは dense_candidate_weight 倍に抑える
+                     TF-IDF側で拾えなかった分だけを少数追加する。
+
+        返す値は常に「TF-IDFのコサイン」で、意味側の値は混ぜない (尺度が違うので、混ぜると後段の
+        正規化や min_text_score の意味が崩れる)。意味の近さは _score_candidates が別の欄で持つ。
+        意味だけで拾った候補の TF-IDF スコアは、実際に計算した値 (文字が合わなければ0に近い)。
         """
         cfg = self.config
         candidates = self._lexical_candidates(query_tokens)
 
         if query_semantic is not None and cfg.dense_candidates > 0:
             seen = {idx for _, idx in candidates}
+            query_vector = self.index.query_vector(query_tokens)
             added = 0
-            for sim, idx in self.dense.search(query_semantic, cfg.dense_candidates * 4, cfg.dense_min_sim):
+            for _sim, idx in self.dense.search(query_semantic, cfg.dense_candidates * 4, cfg.dense_min_sim):
                 if idx in seen or not self._is_valid_pair(idx):
                     continue
-                candidates.append((cfg.dense_candidate_weight * sim, idx))
+                text_score = self.index.cosine(query_vector, idx)
+                if self._has_good_tag(idx):
+                    text_score *= cfg.good_tag_multiplier  # 文字一致の候補と同じ扱い
+                candidates.append((text_score, idx))
                 added += 1
                 if added >= cfg.dense_candidates:
                     break
@@ -1729,9 +1772,10 @@ class Himawaria:
         # 候補すべての「入力との意味の近さ」を、密索引の行列積でまとめて求める
         semantics = (
             self.dense.similarities([idx for _, idx in candidates], query_semantic)
-            if cfg.semantic_score_weight and query_semantic is not None
+            if query_semantic is not None
             else [0.0] * len(candidates)
         )
+        floor = min(max(cfg.semantic_score_floor, 0.0), 0.99)
 
         items = [
             _Candidate(
@@ -1758,7 +1802,8 @@ class Himawaria:
                 + cfg.history_score_weight * history_norm[i]
                 + (cfg.good_tag_bonus if it.good else 0.0)
                 + cfg.chara_style_weight * style_norm[i]
-                + cfg.semantic_score_weight * it.semantic  # 正規化せず生のコサイン (全部低ければ加点も小さい)
+                # 意味は候補間の相対 (min-max) ではなく絶対尺度で採点する。全員が意味的に遠ければ加点も0のまま
+                + cfg.semantic_score_weight * max(0.0, (it.semantic - floor) / (1.0 - floor))
             )
         return items
 
@@ -1767,8 +1812,14 @@ class Himawaria:
         top = heapq.nlargest(max(2, cfg.near_tie_pool_size), scored, key=lambda it: it.final)
         best = top[0]
 
-        if best.text <= cfg.min_text_score:
-            logger.info("返信見送り: TF-IDF類似度が不足 (score=%.4f, force=%s)", best.text, force)
+        # 返信の根拠は「文字が合っている」か「意味が十分近い」のどちらか。尺度の違う2つの値は混ぜず、別々に判定する
+        lexical_ok = best.text > cfg.min_text_score
+        semantic_ok = cfg.dense_candidates > 0 and best.semantic >= cfg.dense_min_sim
+        if not (lexical_ok or semantic_ok):
+            logger.info(
+                "返信見送り: TF-IDF類似度 (%.4f) も意味類似度 (%.4f) も不足 (force=%s)",
+                best.text, best.semantic, force,
+            )
             return None
 
         # 僅差なら上位からランダムに選んで単調さを避ける
@@ -1796,7 +1847,7 @@ class Himawaria:
             query_semantic = self.semantic_learner.embed_text(x)
         candidates = self._collect_candidates(query_tokens, query_semantic)
         if not candidates:
-            logger.info("検索候補なし: TF-IDF類似度が閾値以下です (force=%s)", force)
+            logger.info("検索候補なし: TF-IDF・意味のどちらでも候補がありません (force=%s)", force)
             return None
 
         best = self._pick_best(self._score_candidates(candidates, x, u, query_semantic), force)
