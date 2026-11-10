@@ -1074,6 +1074,11 @@ class ContextualWordReplacer:
         self._rule_cache: dict[tuple, list[dict]] = {}
 
     MIN_ANCHOR_CHARS = 2  # 差分の前後で、これ以上続く共通部分だけを「変わっていない部分」とみなす
+    # 差分と差分の「間」にある共通部分は、これ以上長いときだけ「変わっていない部分」とみなす。
+    # 短い共通部分は偶然の一致のことが多い (Pyth-on と Comm-on の "on" など)。そこで語を切ると
+    # 「Pyth→Comm」のような切れ端のルールになるので、間の共通部分ごとひとまとまりの置換にする
+    # (ルールは長くなるが、より限定的になるだけで壊れない)
+    MIN_INTERIOR_ANCHOR_CHARS = 3
     RULE_CACHE_SIZE = 4096
     # 語の途中から強制的に切り出したトークンで置換するときの安全策。
     # 記憶の中でありふれていて、しかも短い文字列 (「った」「ない」など、文法の断片) は、他の語の一部に
@@ -1123,7 +1128,7 @@ class ContextualWordReplacer:
         for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
             if tag == "equal":
                 continue
-            if spans and i1 - spans[-1][1] < anchor:  # 間の共通部分が短い → 同じ差分として繋ぐ
+            if spans and i1 - spans[-1][1] < self.MIN_INTERIOR_ANCHOR_CHARS:  # 間の共通部分が短い → 同じ差分として繋ぐ
                 spans[-1][1], spans[-1][3] = i2, j2
             else:
                 spans.append([i1, i2, j1, j2])
@@ -1165,6 +1170,21 @@ class ContextualWordReplacer:
                 old_tokens = before_tokens[i1:i2]
                 new_tokens = after_tokens[j1:j2]
 
+                # 1文字トークンが並んだだけの断片 (「C++」→ C,+,+ / 「CommonLisp」→ C,o,m,m,on,L,i,s,p) は、
+                # 差が出た部分だけ切り出すと「++」→「ommonLisp」のような語として成り立たない切れ端になる。
+                # 隣り合う同じ1文字トークンまで含めて、ひとかたまりの語として扱う。
+                # (チャンネルIDのような長い数字列は、全体が長さ制限を超えるので自然に外れる)
+                fragment_run = len(old_tokens) >= 2 and all(len(tok) == 1 for tok in old_tokens)
+                if fragment_run:
+                    while i1 > 0 and j1 > 0 and len(before_tokens[i1 - 1]) == 1 and before_tokens[i1 - 1] == after_tokens[j1 - 1]:
+                        i1 -= 1
+                        j1 -= 1
+                    while i2 < len(before_tokens) and j2 < len(after_tokens) and len(before_tokens[i2]) == 1 and before_tokens[i2] == after_tokens[j2]:
+                        i2 += 1
+                        j2 += 1
+                    old_tokens = ["".join(before_tokens[i1:i2])]
+                    new_tokens = ["".join(after_tokens[j1:j2])]
+
                 # 左右6トークンずつの環境（文脈）を保存（インデックスの範囲外はBOS/EOSでパディング）
                 left_context = before_tokens[max(0, i1 - WINDOW_SIZE):i1]
                 if i1 - WINDOW_SIZE < 0:
@@ -1174,12 +1194,20 @@ class ContextualWordReplacer:
                 if i2 + WINDOW_SIZE > len(before_tokens):
                     right_context = right_context + ["<EOS>"] * (i2 + WINDOW_SIZE - len(before_tokens))
 
-                for old_core, new_core, whole in self._core_pairs("".join(old_tokens), "".join(new_tokens)):
+                core_pairs = (
+                    [(old_tokens[0], new_tokens[0], True)]  # 断片の並びは、すでに語の単位にしてある
+                    if fragment_run
+                    else self._core_pairs("".join(old_tokens), "".join(new_tokens))
+                )
+                for old_core, new_core, whole in core_pairs:
                     # 全体が入れ替わっているなら元のトークン列のまま、一部なら芯だけを1語として扱う
                     # 名前 (登録語) の入れ替えは、文字単位の差分で切らず必ず丸ごと1語として扱う
                     # (「小関琉聖だった人」→「小関琉聖」が「だった人」の削除になって捨てられるのを防ぐ)
                     named = "".join(old_tokens) in self.protected_words or "".join(new_tokens) in self.protected_words
                     rule_old, rule_new = (old_tokens, new_tokens) if (whole or named) else ([old_core], [new_core])
+                    # 置換先は出力の連結にしか使わない (マッチングに使うのは置換元だけ) ので、1つの文字列にまとめる。
+                    # トークナイザが未知語を1文字ずつに分けても (「CommonLisp」→ 9トークン)、トークン数の上限で捨てない
+                    rule_new = ["".join(rule_new)]
                     if not self._is_usable_rule(rule_old, rule_new):
                         continue
                     replacements.append({
