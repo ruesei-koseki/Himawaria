@@ -2138,6 +2138,7 @@ class Himawaria:
             self_names=self.my_names, base_speaker=self._person_name(self.last_bot_base_user) or "",
         )
         result = result.replace("[YOU]", self.last_user)
+        result = result.replace("[ME]", self.settings["myname"])
 
         self.current_voice = result
         logger.info("座標: %d / ログ: %s / 心の声: %s", self.heart, self.user_log, result)
