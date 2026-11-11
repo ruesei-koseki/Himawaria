@@ -23,6 +23,7 @@ import pickle
 import random
 import re
 import time
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,8 +94,6 @@ DUPLICATE_SIMILARITY = 0.85
 
 _REPEAT_RE = re.compile(r"(.)\1{2,}")
 _DIGIT_SPLIT_RE = re.compile(r"(\d+)")
-# 漢字 / ひらがな / カタカナ(長音含む) / 英数字 の連続。これ以外 (句読点・記号・空白) は語に含めない
-_SCRIPT_RUN_RE = re.compile(r"[一-鿿々〆]+|[ぁ-ゟ]+|[ァ-ヿ]+|[A-Za-z0-9Ａ-Ｚａ-ｚ０-９]+")
 
 
 @dataclass(frozen=True)
@@ -346,12 +345,17 @@ class NgramTokenizer:
                 tokens.extend(self._split_by_pmi(segment, drop_threshold))
         return tokens
 
-    def tokenize_words(self, text: str, hira_threshold: float = 0.4) -> list[str]:
-        """意味ベクトル用の語分割。文字種の切れ目を使うので、語の途中で切れにくい。
+    @staticmethod
+    def _is_token_character(char: str) -> bool:
+        """Unicodeの文字・数字・結合文字を語の構成要素として扱う。文字体系は区別しない。"""
+        category = unicodedata.category(char)
+        return category[0] in {"L", "N", "M"}
 
-        漢字の連続・カタカナの連続・英数字の連続はそのまま1語にし、ひらがなの連続だけを
-        PMIで割る (「映画音楽ばっかり聴いてる」→ 映画音楽 / ばっ / かり / 聴 / いてる)。
-        句読点や記号は捨てる。登録単語 (話者名など) は先に1語として切り出す。
+    def tokenize_words(self, text: str, cohesion_threshold: float = 0.4) -> list[str]:
+        """意味ベクトル用の語分割。文字体系に依存せず、連続部分をPMIで分割する。
+
+        Unicode上の文字・数字・結合文字を同じ規則で扱い、空白・句読点・記号を境界とする。
+        登録単語 (話者名など) は先に1語として切り出す。
         """
         if not text:
             return []
@@ -365,12 +369,16 @@ class NgramTokenizer:
             if forced:
                 tokens.append(segment)
                 continue
-            for match in _SCRIPT_RUN_RE.finditer(segment):
-                run = match.group()
-                if "ぁ" <= run[0] <= "ゟ":
-                    tokens.extend(self._split_by_pmi(run, hira_threshold))
-                else:
-                    tokens.append(run)
+            run_start = None
+            for i, char in enumerate(segment):
+                if self._is_token_character(char):
+                    if run_start is None:
+                        run_start = i
+                elif run_start is not None:
+                    tokens.extend(self._split_by_pmi(segment[run_start:i], cohesion_threshold))
+                    run_start = None
+            if run_start is not None:
+                tokens.extend(self._split_by_pmi(segment[run_start:], cohesion_threshold))
         return tokens
 
     def save(self, file_path: Path | str):
@@ -412,7 +420,7 @@ class SemanticSpace:
     旧設計は「疎PPMI (置換用)」と「密SVD (検索用)」が別々に存在し、語分割も別、
     未知語は完全に無視、という二重構造だった。ここでは1つに統合し、次の流れで作る。
 
-    1. 語分割   : NgramTokenizer.tokenize_words (文字種の切れ目 + ひらがなだけPMI)
+    1. 語分割   : NgramTokenizer.tokenize_words (Unicode一般カテゴリの境界 + 全文字列PMI)
     2. 共起     : 同じ発言内 (距離で重み付け 1/距離) + 直前の発言との間 (弱く)
     3. PPMI     : 文脈語の確率を cds 乗で平滑化。shift で弱い関連を切り捨て
     4. SVD      : dim 次元に圧縮 (語ベクトル = U·√S)
@@ -434,7 +442,7 @@ class SemanticSpace:
         turn_weight: float = 0.3,
         max_repeat: int = 2,
         max_vocab: int = 30_000,
-        hira_threshold: float = 0.4,
+        cohesion_threshold: float = 0.4,
         sif_a: float = 1e-3,
         remove_components: int = 1,
         sub_ngrams: tuple[int, ...] = (2, 3),
@@ -449,7 +457,7 @@ class SemanticSpace:
         self.turn_weight = turn_weight
         self.max_repeat = max_repeat
         self.max_vocab = max_vocab
-        self.hira_threshold = hira_threshold
+        self.cohesion_threshold = cohesion_threshold
         self.sif_a = sif_a
         self.remove_components = remove_components
         self.sub_ngrams = tuple(sub_ngrams)
@@ -479,13 +487,13 @@ class SemanticSpace:
     # ------------------------------------------------------------------
     @staticmethod
     def _keep_token(token: str) -> bool:
-        """助詞・語尾の1文字 (は・が・て…) は捨てる。漢字1文字 (猫・車) は語として残す。"""
-        return len(token) > 1 or "一" <= token <= "鿿"
+        """文字種や文字数で語を捨てず、採否は学習時の統計情報で判断する。"""
+        return bool(token)
 
     def _tokens(self, text: str) -> list[str]:
         if self.tokenizer is None:
             return []
-        return [t for t in self.tokenizer.tokenize_words(text, self.hira_threshold) if self._keep_token(t)]
+        return [t for t in self.tokenizer.tokenize_words(text, self.cohesion_threshold) if self._keep_token(t)]
 
     @staticmethod
     def _usable_text(text) -> bool:
@@ -643,9 +651,9 @@ class SemanticSpace:
     # サブワード補完 (未知語対策)
     # ------------------------------------------------------------------
     def _subwords(self, token: str) -> list[str]:
-        """語を構成する文字n-gram。漢字1文字の語はその文字自身。"""
+        """語を構成する文字n-gram。1文字語も文字種によらず自身を特徴として使う。"""
         if len(token) == 1:
-            return [token] if "一" <= token <= "鿿" else []
+            return [token]
         grams: list[str] = []
         for n in self.sub_ngrams:
             if n <= len(token):
@@ -1095,21 +1103,26 @@ class ContextualWordReplacer:
             return False
         return self.commonness_func(text) >= self.FORCED_SPLIT_COMMON_RATIO
 
-    @staticmethod
-    def _is_ideograph(text: str) -> bool:
-        """漢字1文字 (「猫」「車」など。1文字でも単語として置換してよい)"""
-        return len(text) == 1 and "一" <= text <= "鿿"
-
     def _is_usable_rule(self, old_tokens: list[str], new_tokens: list[str]) -> bool:
-        old_text, new_text = "".join(old_tokens), "".join(new_tokens)
+        """文字種に依存せず、誤適用しにくい置換ルールだけを採用する。"""
+        if not old_tokens or not new_tokens:
+            return False
+
+        old_text = "".join(old_tokens)
+        new_text = "".join(new_tokens)
         if not new_text or old_text == new_text:
             return False
-        # 1文字トークンが2つ以上並んだだけの断片は、トークナイザが「まとまり」と認めていない文字列の切れ端。
-        # (チャンネルIDの数字 "5","6" → "0","8" のように、桁の差が語の置換ルールになってしまう)
-        if len(old_tokens) >= 2 and all(len(token) == 1 for token in old_tokens):
+
+        # 複数の1文字トークンからなる断片は、語として認識されていない可能性が高い。
+        if len(old_tokens) > 1 and all(len(token) == 1 for token in old_tokens):
             return False
-        if len(old_text) < self.MIN_RULE_CHARS and not self._is_ideograph(old_text):
-            return False
+
+        # 短い文字列は誤一致しやすい。登録語、または記憶内で十分に稀な語だけ許可する。
+        # 文字種ではなく、実際のコーパス頻度で判断する。頻度情報が無ければ安全側に倒す。
+        if len(old_text) < self.MIN_RULE_CHARS and old_text not in self.protected_words:
+            if self.commonness_func is None or self._is_common(old_text):
+                return False
+
         if len(old_tokens) > self.MAX_RULE_TOKENS or len(new_tokens) > self.MAX_RULE_TOKENS:
             return False
         return max(len(old_text), len(new_text)) <= self.MAX_RULE_CHARS
@@ -1149,7 +1162,8 @@ class ContextualWordReplacer:
 
     def extract_token_replacements(self, before_tokens: list[str], after_tokens: list[str]) -> list[dict]:
         """置換ルールを抽出する。履歴はほぼ毎回同じ内容なので結果を使い回す。"""
-        key = (tuple(before_tokens), tuple(after_tokens), len(self.protected_words))  # 名前が増えたら作り直す
+        # 登録語の「個数」ではなく内容をキーにする。同数の名前を入れ替えた場合も安全。
+        key = (tuple(before_tokens), tuple(after_tokens), frozenset(self.protected_words))
         rules = self._rule_cache.get(key)
         if rules is None:
             if len(self._rule_cache) >= self.RULE_CACHE_SIZE:
@@ -1901,30 +1915,6 @@ class Himawaria:
     # ------------------------------------------------------------------
     # 単語置換
     # ------------------------------------------------------------------
-    @staticmethod
-    def _diff_replacements(before_tokens: list[str], after_tokens: list[str]) -> list[tuple[str, str]]:
-        """before -> after の差分から (旧, 新) の置換ペアを取り出す"""
-        pairs: list[tuple[str, str]] = []
-        old = new = ""
-        for diff in difflib.ndiff(before_tokens, after_tokens):
-            tag, content = diff[:2], diff[2:]
-            if tag == "- ":
-                old += content
-            elif tag == "+ ":
-                new += content
-            elif tag == "  ":
-                if (old or new) and len(old) >= 2:
-                    pairs.append((old, new))
-                old = new = ""
-        if (old or new) and len(old) >= 2:
-            pairs.append((old, new))
-        return pairs
-
-    def _is_similar_word(self, token: str, old: str) -> bool:
-        if Levenshtein.normalized_similarity(token, old) >= REPLACE_CHAR_SIMILARITY:
-            return True
-        return self.semantic_learner.calculate_similarity(token, old) >= REPLACE_SEMANTIC_SIMILARITY
-
     @staticmethod
     def _person_name(speaker) -> str | None:
         """話者IDから人間の名前を取り出す。bot・システム・予約名ならNone。"""
