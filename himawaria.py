@@ -586,6 +586,8 @@ class Himawaria:
         self.memory["word_replacer_memory_before"] = self.word_replacer_memory_before
 
         result = self.replaceWords(result, self.word_replacer_memory_after, self.word_replacer_memory_before)
+        result = result.replace("[YOU]", self.last_user)
+        result = result.replace("[ME]", self.settings["myname"])
         self.current_voice = result
         print("座標: {}".format(self.heart))
         print("ログ: {}".format(self.user_log))
